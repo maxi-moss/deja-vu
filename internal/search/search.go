@@ -2237,6 +2237,9 @@ func printContextChunks(w io.Writer, s model.Session, budget int, include func(m
 		// window can sit where the identifying words are rather than where the
 		// common ones repeat.
 		weight float64
+		// msg is the turn's place in the session, so the line after a cut
+		// window can say whether the last turn was shown.
+		msg int
 	}
 	// The include callback carries state from turn to turn (prevKept), so which
 	// turns are kept is decided in one ordered pass. Rendering them is not:
@@ -2247,13 +2250,23 @@ func printContextChunks(w io.Writer, s model.Session, budget int, include func(m
 	// from predicted ones and the window moves. Spreading the same renders
 	// across cores keeps the output identical by construction.
 	var kept []contextTurn
+	var keptAt []int
 	parts := 0
-	for _, m := range s.Messages {
+	// Turns the include rule passed over, and the session's last turn: both
+	// are what the line under a cut window reports.
+	skipped, last := 0, -1
+	for i, m := range s.Messages {
 		if isWorkRecord(m.Role) {
 			continue
 		}
+		if strings.TrimSpace(m.Text) != "" {
+			last = i
+		}
 		ok, hits := include(m)
 		if !ok {
+			if strings.TrimSpace(m.Text) != "" {
+				skipped++
+			}
 			continue
 		}
 		if len(hits) > parts {
@@ -2266,6 +2279,7 @@ func printContextChunks(w io.Writer, s model.Session, budget int, include func(m
 			}
 		}
 		kept = append(kept, contextTurn{role: m.Role, raw: raw, hits: hits})
+		keptAt = append(keptAt, i)
 	}
 	weights := contextTurnWeights(kept, parts)
 	rendered := renderContextTurns(kept)
@@ -2275,10 +2289,20 @@ func printContextChunks(w io.Writer, s model.Session, budget int, include func(m
 		if strings.TrimSpace(text) == "" {
 			continue
 		}
-		chunks = append(chunks, chunk{fmt.Sprintf("\n## %s\n\n%s\n", k.role, text), weights[i]})
+		chunks = append(chunks, chunk{fmt.Sprintf("\n## %s\n\n%s\n", k.role, text), weights[i], keptAt[i]})
 	}
 	if len(chunks) == 0 {
 		return 0
+	}
+	// A window that holds less than the session says so, and the room for
+	// saying it comes out of the budget before the window is chosen: 8 KB that
+	// ended mid-word with nothing after it read as the whole session (#5392).
+	total := 0
+	for _, c := range chunks {
+		total += len(c.text)
+	}
+	if skipped > 0 || total > budget {
+		budget = max(0, budget-contextCutReserve)
 	}
 	// Anchor the budget window where the matched turns are densest, with one turn
 	// of lead-in (usually the question when the answer is what matched). Walking
@@ -2309,23 +2333,81 @@ func printContextChunks(w io.Writer, s model.Session, budget int, include func(m
 	if best > 0 && start > 0 && span+len(chunks[start-1].text) <= budget {
 		start--
 	}
-	written := 0
-	for _, c := range chunks[start:] {
+	written, end, cutLeft := 0, start, 0
+	for i, c := range chunks[start:] {
 		if written >= budget {
 			break
 		}
 		text := c.text
 		if written+len(text) > budget {
-			cut := max(0, budget-written)
-			for cut > 0 && !utf8.RuneStart(text[cut]) {
-				cut--
+			cut := cutAtWord(text, budget-written)
+			// A heading and a few words is not a turn shown; it is left out
+			// and counted with the others.
+			if cut < strings.Index(text, "\n\n")+2+contextCutMinBody {
+				break
 			}
-			text = text[:cut]
+			cutLeft = len(text) - cut
+			text = strings.TrimRight(text[:cut], " \t\n")
 		}
 		fmt.Fprint(w, text)
 		written += len(text)
+		end = start + i + 1
+	}
+	if written == 0 {
+		return 0
+	}
+	id := SafeLine(s.ID)
+	if cutLeft > 0 {
+		note := fmt.Sprintf(" …\n[this turn is cut here, %s more of it left out — `deja show %s` prints the rest]\n", approxSize(cutLeft), id)
+		fmt.Fprint(w, note)
+		written += len(note)
+	}
+	shown := end - start
+	if left := start + len(chunks) - end + skipped; left > 0 || cutLeft > 0 {
+		lastShown := chunks[end-1].msg == last
+		final := ""
+		switch {
+		case !lastShown:
+			final = ", the last turn not among them"
+		case cutLeft > 0:
+			final = ", the last one cut short"
+		}
+		note := fmt.Sprintf("\n[%d of %d turns shown%s — `deja show %s` prints every turn]\n", shown, shown+left, final, id)
+		fmt.Fprint(w, note)
+		written += len(note)
 	}
 	return written
+}
+
+// contextCutReserve is the room kept for the two lines a cut window prints,
+// and contextCutMinBody the least of a turn worth printing before its marker.
+const (
+	contextCutReserve = 320
+	contextCutMinBody = 160
+)
+
+// cutAtWord is where to cut text to fit n bytes: the last space within reach,
+// or the last whole rune when a word runs longer than that.
+func cutAtWord(text string, n int) int {
+	if n >= len(text) {
+		return len(text)
+	}
+	cut := max(0, n)
+	for cut > 0 && !utf8.RuneStart(text[cut]) {
+		cut--
+	}
+	if i := strings.LastIndexAny(text[:cut], " \t\n"); i > 0 && i >= cut-200 {
+		return i
+	}
+	return cut
+}
+
+// approxSize is a byte count the way a reader sizes text.
+func approxSize(n int) string {
+	if n < 1024 {
+		return fmt.Sprintf("%d bytes", n)
+	}
+	return fmt.Sprintf("%d KB", (n+512)/1024)
 }
 
 func Recent(ss []model.Session, n int) []model.Session {
@@ -3052,6 +3134,7 @@ func RelevanceHitsWeighted(ss []model.Session, terms []string, idf map[string]fl
 		weight = termWeights(ss, terms)
 	}
 	hits := make([]Hit, len(ss))
+	set := newTermSet(terms)
 	// One session's score is read from that session alone, and lowercasing its
 	// messages is where the time goes: profiled on a real store, a recall
 	// answer spent 2.4 s in it and in the ranker's own copy of the same loop.
@@ -3081,30 +3164,23 @@ func RelevanceHitsWeighted(ss []model.Session, terms []string, idf map[string]fl
 			dump     bool
 		}
 		best := make([]msgScore, 0, 8)
+		found := make([]bool, len(terms))
+		var pos []int
 		for mi, m := range s.Messages {
 			// The same rule the scoring loop applies: a transcript's record of
 			// a call to deja is not something anyone said, and this tier is
 			// where the live miss came through — the scoring loop was fixed
 			// first and the hit arrived here instead (#2067).
 			low := lower(withoutOwnCallLog(m.Text))
-			var foldedLow string
+			pos, _ = set.match(low, found, pos)
 			distinct := 0
 			weighted := 0.0
 			center := ""
 			// The rarest term a message holds is what names it, so it is what
 			// the excerpt gets centred on.
 			heaviest := 0.0
-			for _, t := range terms {
-				found := strings.Contains(low, t)
-				if !found {
-					if ft := cjkfold.String(t); ft != t || cjkfold.HasCJK(t) {
-						if foldedLow == "" {
-							foldedLow = cjkfold.String(low)
-						}
-						found = strings.Contains(foldedLow, ft)
-					}
-				}
-				if !found {
+			for ti, t := range terms {
+				if !found[ti] {
 					continue
 				}
 				distinct++

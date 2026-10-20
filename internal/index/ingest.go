@@ -93,6 +93,9 @@ func mergeIngestDiag(m *Manifest) {
 	records := sources.DiagUnusableRecords()
 	foldDeferred(m, sources.DiagNoZstdPaths())
 	malformed, failed := sources.DiagSnapshot()
+	for _, n := range malformed {
+		skippedThisRun.Add(int64(n))
+	}
 	if m.IngestFiles == nil {
 		m.IngestFiles = map[string]FileIngest{}
 	}
@@ -143,9 +146,11 @@ func mergeIngestDiag(m *Manifest) {
 		}
 		m.IngestFiles[p] = e
 	}
+	walk := sources.WalkFailures()
 	for p, msg := range failed {
 		e := m.IngestFiles[p]
 		e.Error = msg
+		e.Walk = walk[p] != ""
 		m.IngestFiles[p] = e
 	}
 	// A file this pass read is a file that opens. Only the error goes: the bad
@@ -155,7 +160,27 @@ func mergeIngestDiag(m *Manifest) {
 			continue
 		}
 		if e, ok := m.IngestFiles[p]; ok && e.Error != "" {
-			e.Error = ""
+			e.Error, e.Walk = "", false
+			if e.Malformed == 0 && e.Clipped == 0 {
+				delete(m.IngestFiles, p)
+			} else {
+				m.IngestFiles[p] = e
+			}
+		}
+	}
+	// A path the walk refused before and reads now: a transcript unchanged
+	// since it was indexed, or a directory that lists again (#5393). Only
+	// the walk's own refusals: a parse error on an unchanged file stands. A
+	// path that is gone has nothing left to report either way, and kept, it
+	// failed every later `deja index` with exit status 3 (#5396).
+	for p, e := range m.IngestFiles {
+		if e.Error == "" || failed[p] != "" {
+			continue
+		}
+		f, walked := passWalked[p]
+		of, held := m.Files[p]
+		if e.Walk && walked && held && sameFile(of, f) || !walked && passWalked != nil && (gone(p) || !held && dirListable(p)) {
+			e.Error, e.Walk = "", false
 			if e.Malformed == 0 && e.Clipped == 0 {
 				delete(m.IngestFiles, p)
 			} else {
@@ -182,6 +207,15 @@ func mergeIngestDiag(m *Manifest) {
 	// and `deja sync` writes one, from Import, right after a pass.
 	passParsed, passRead = nil, nil
 }
+
+// skippedThisRun counts the lines this process skipped in what it read, over
+// every pass it ran. Lines skipped by an earlier run are in the manifest, not
+// here: a run that read nothing new skipped nothing.
+var skippedThisRun atomic.Int64
+
+// SkippedThisRun returns how many lines or records this process's passes read
+// and could not use.
+func SkippedThisRun() int { return int(skippedThisRun.Load()) }
 
 // healthFromFiles sums the per-file counts per harness.
 //
@@ -279,6 +313,9 @@ func Ensure(dir string, harness string, force bool, progress io.Writer) error {
 	if dir == "" {
 		dir = DefaultDir()
 	}
+	if autoUpdatesOff() {
+		return manualCheck(dir)
+	}
 	unlock, err := lockDir(dir)
 	if err != nil {
 		return err
@@ -331,6 +368,9 @@ func EnsureUnlessBusy(dir string, progress io.Writer) (bool, error) {
 	if dir == "" {
 		dir = DefaultDir()
 	}
+	if autoUpdatesOff() {
+		return false, manualCheck(dir)
+	}
 	unlock, ok, err := tryLockDir(dir)
 	if err != nil {
 		return false, err
@@ -351,6 +391,9 @@ func EnsureUnlessBusy(dir string, progress io.Writer) (bool, error) {
 func EnsureForSearch(dir string, o query.Options, force bool, progress io.Writer) error {
 	if dir == "" {
 		dir = DefaultDir()
+	}
+	if autoUpdatesOff() {
+		return manualCheck(dir)
 	}
 	unlock, err := lockDir(dir)
 	if err != nil {
@@ -375,6 +418,9 @@ func EnsureForSearch(dir string, o query.Options, force bool, progress io.Writer
 func EnsureForSearchNoWait(dir string, o query.Options, progress io.Writer) (busy bool, err error) {
 	if dir == "" {
 		dir = DefaultDir()
+	}
+	if autoUpdatesOff() {
+		return false, manualCheck(dir)
 	}
 	unlock, ok, err := tryLockDir(dir)
 	if err != nil {
@@ -418,7 +464,9 @@ func Unwritable(err error) bool {
 // ensureLocked is the body of an Ensure, with the lock already held.
 func ensureLocked(dir string, o query.Options, force bool, progress io.Writer) error {
 	sweepStaleTmp(dir)
-	prior, priorErr := readManifest(dir)
+	// Cached, and only read: the search that follows reads the same one, and
+	// decoding it twice was most of the manifest's cost to a search (#5386).
+	prior, priorErr := readManifestCached(dir)
 	want := currentFilesReusing("", priorFiles(prior, priorErr))
 	scope := ""
 	m, err := prior, priorErr
@@ -465,8 +513,31 @@ func ensureLocked(dir string, o query.Options, force bool, progress io.Writer) e
 // kicked to a detached warmup instead. The return value says whether the
 // caller is serving a stale view so it can say so honestly.
 func EnsureForSearchStale(dir string, o query.Options, progress io.Writer) (bool, error) {
+	c, err := EnsureForSearchCoverage(dir, o, progress)
+	return c.Stale, err
+}
+
+// EnsureForSearchCoverage is EnsureForSearchStale with what a stale answer
+// covers, for the line that says so (#5390).
+func EnsureForSearchCoverage(dir string, o query.Options, progress io.Writer) (Coverage, error) {
 	if dir == "" {
 		dir = DefaultDir()
+	}
+	stale, pending, found, err := ensureForSearchStale(dir, o, progress)
+	if err != nil || !stale {
+		return Coverage{}, err
+	}
+	c := SnapshotCoverage(dir)
+	c.Stale, c.Pending, c.Found = true, pending, found
+	return c, nil
+}
+
+// ensureForSearchStale also returns, when it walked the stores before handing
+// the work on, how many transcripts are new or changed since the snapshot and
+// how many it found; zeros when it did not walk or could not tell.
+func ensureForSearchStale(dir string, o query.Options, progress io.Writer) (bool, int, int, error) {
+	if autoUpdatesOff() {
+		return false, 0, 0, manualCheck(dir)
 	}
 	// The wait before an answer is made of three things — taking the lock,
 	// walking the stores to see what changed, and ingesting whatever did — and
@@ -475,30 +546,32 @@ func EnsureForSearchStale(dir string, o query.Options, progress io.Writer) (bool
 	mark := searchTrace()
 	unlock, ok, err := tryLockDir(dir)
 	if err != nil {
-		return false, err
+		return false, 0, 0, err
 	}
 	if !ok {
 		// A rebuild is already running; serve the current snapshot.
-		return true, nil
+		return true, 0, 0, nil
 	}
 	defer unlock()
 	mark("lock")
 	// Read first, walk second: this is the path every search takes, and
 	// re-deriving state for unchanged transcripts was costing 700 ms of the
-	// second it takes to answer a query.
-	m, err := readManifest(dir)
+	// second it takes to answer a query. Through the cache, since nothing here
+	// writes to it: a long-lived server decoded every session's metadata on
+	// every recall, 12 MB on a 25k-session store (#5386).
+	m, err := readManifestCached(dir)
 	mark("manifest")
 	want := currentFilesReusing("", priorFiles(m, err))
 	mark("walk stores")
 	if err != nil || m.Scope != "" || !recordsIntact(dir, m) || mustRebuildBeforeAnswering(m, version) {
 		// No usable index yet (or a rebuild-grade problem): the caller cannot
 		// serve anything sensible stale, so build synchronously.
-		return false, updateIndex(dir, o.Harness, "", want, false, progress)
+		return false, 0, 0, updateIndex(dir, o.Harness, "", want, false, progress)
 	}
 	if newerIndex(m) {
 		// Left alone, and current as far as this build can tell: calling it
 		// stale handed it to a warmup that would not touch it either.
-		return false, nil
+		return false, 0, 0, nil
 	}
 	if m.Version != version {
 		// A content-version bump that this build can still read: the store
@@ -507,15 +580,15 @@ func EnsureForSearchStale(dir string, o query.Options, progress io.Writer) (bool
 		// first question after an upgrade wait for the whole pass — 13m54s on
 		// a 520 MB store, and an agent that waited a minute gave up on the
 		// tool (#3552).
-		return true, nil
+		return true, 0, 0, nil
 	}
-	if zoneDrifted(m) {
+	if zoneDrifted(m) || miningChanged(m) {
 		// Regrouping the day buckets or rereading aider headers in this zone
 		// is a full rebuild; hand it to the detached warmup and say the current answer is stale.
-		return true, nil
+		return true, 0, 0, nil
 	}
 	if manifestFresh(m, want, "") {
-		return false, nil
+		return false, 0, 0, nil
 	}
 	changed := map[string]FileState{}
 	removedAny := false
@@ -528,7 +601,7 @@ func EnsureForSearchStale(dir string, o query.Options, progress io.Writer) (bool
 		if p == syncImportPath {
 			continue
 		}
-		if _, ok := want[p]; !ok {
+		if _, ok := want[p]; !ok && !behindLockedDir(p) {
 			removedAny = true
 		}
 	}
@@ -545,15 +618,15 @@ func EnsureForSearchStale(dir string, o query.Options, progress io.Writer) (bool
 		// like rewrite-grade work: the answer comes from the snapshot with the
 		// "as it was" line, and the tail lands before the next question.
 		if tail := appendTailBytes(changed, m.Files); tail > inlineAppendMax {
-			return true, nil
+			return true, len(changed), len(want), nil
 		}
 		err := updateIndex(dir, o.Harness, "", want, false, progress)
 		mark("append")
-		return false, err
+		return false, 0, 0, err
 	}
 	// Caller detaches the rebuild (it owns the executable path).
 	mark("hand to warmup")
-	return true, nil
+	return true, len(changed), len(want), nil
 }
 
 // redactionFloor is the last content version whose bump was about what may be
@@ -702,7 +775,7 @@ func rebuildWithTombstones(dir string, harness string, scope string, files map[s
 	// incremental build carries the old stamp forward: it keeps records it
 	// wrote under the previous patterns, which is why `deja index` has to ask
 	// for a rebuild rather than quietly declaring the new list in force (#1307).
-	m := Manifest{Version: version, KeptDated: true, Format: onDiskFormat, Files: files, Sessions: map[string]SessionMeta{}, BuiltAt: time.Now(), SourcesReadAt: time.Now(), ReadZone: zoneFingerprint(), Generation: time.Now().UTC().Format(time.RFC3339Nano), Scope: scope,
+	m := Manifest{Version: version, KeptDated: true, Format: onDiskFormat, SearchOnly: searchOnlyFor(dir), Files: files, Sessions: map[string]SessionMeta{}, BuiltAt: time.Now(), SourcesReadAt: time.Now(), ReadZone: zoneFingerprint(), Generation: time.Now().UTC().Format(time.RFC3339Nano), Scope: scope,
 		ExportWatermarks: imported.watermarks, ExportBoundary: imported.boundary, ImportedRecords: imported.dedupe,
 		Compactions:        compactions,
 		ExcludeFingerprint: sources.ExclusionFingerprint(),
@@ -812,27 +885,30 @@ func rebuildWithTombstones(dir string, harness string, scope string, files map[s
 	// store that is eight seconds of a twenty-second build, and it used to run
 	// under the previous phase's last percentage, so the bar sat still through
 	// it (#3372).
-	reportPhase("mining fixes and commands", 5)
-	// Five passes over the same sessions, each writing its own file and reading
-	// nothing the others write, so they run together rather than one after the
-	// other. Profiled on a real store, they were 9.4 s (fixes) and 6.0 s
-	// (co-occurrence) of a 51 s build, with the whole machine idle beside them.
-	var sidecars sync.WaitGroup
-	for _, build := range []func(){
-		func() { buildCooccur(tmp, ss) },
-		func() { buildFixes(tmp, ss, func(s model.Session) string { return s.Harness + ":" + s.ID }) },
-		func() { buildCommands(tmp, ss) },
-		func() { buildCommandFails(tmp, ss) },
-		func() { buildSessionFacts(tmp, ss) },
-	} {
-		sidecars.Add(1)
-		go func() {
-			defer sidecars.Done()
-			build()
-			reportAdvance(1)
-		}()
+	// Skipped whole on a search-only index (#5395).
+	if !m.SearchOnly {
+		reportPhase("mining fixes and commands", 5)
+		// Five passes over the same sessions, each writing its own file and reading
+		// nothing the others write, so they run together rather than one after the
+		// other. Profiled on a real store, they were 9.4 s (fixes) and 6.0 s
+		// (co-occurrence) of a 51 s build, with the whole machine idle beside them.
+		var sidecars sync.WaitGroup
+		for _, build := range []func(){
+			func() { buildCooccur(tmp, ss) },
+			func() { buildFixes(tmp, ss, func(s model.Session) string { return s.Harness + ":" + s.ID }) },
+			func() { buildCommands(tmp, ss) },
+			func() { buildCommandFails(tmp, ss) },
+			func() { buildSessionFacts(tmp, ss) },
+		} {
+			sidecars.Add(1)
+			go func() {
+				defer sidecars.Done()
+				build()
+				reportAdvance(1)
+			}()
+		}
+		sidecars.Wait()
 	}
-	sidecars.Wait()
 	reportPhase("writing index", sp.bucketCount())
 	if err := sp.writeBuckets(filepath.Join(tmp, "buckets")); err != nil {
 		return err
@@ -1014,6 +1090,9 @@ func applyRenamedFiles(m *Manifest, renamed map[string]string) map[string]bool {
 // rename moved it to. Nothing was read, so the pairs keep their rows and take
 // the new project; the command tables are mined again from the records.
 func reprojectSidecars(dir string, sessions map[string]SessionMeta, keys map[string]bool) {
+	if BuiltSearchOnly(dir) {
+		return
+	}
 	if raw, ok := readFixRaw(dir); !ok {
 		remineFixes(dir)
 	} else if len(raw) > 0 {
@@ -1336,18 +1415,14 @@ func loadProgress(h string, progress io.Writer) []model.Session {
 		name string
 		ss   []model.Session
 	}
-	reg := sources.Registry()
+	// A store the reader has asked deja not to read is not walked at all.
+	// Without this the only way to stop `needs-sqlite3` advice for a
+	// harness they do not use was to install the package (#3499).
+	reg := sources.StoresToRead()
 	results := make([]loaded, len(reg))
 	var wg sync.WaitGroup
-	skipStore := sources.ExcludedHarnesses()
 	for i, hr := range reg {
 		if h != "" && h != hr.Name {
-			continue
-		}
-		// A store the reader has asked deja not to read is not walked at all.
-		// Without this the only way to stop `needs-sqlite3` advice for a
-		// harness they do not use was to install the package (#3499).
-		if skipStore[hr.Name] {
 			continue
 		}
 		wg.Add(1)
@@ -1663,7 +1738,7 @@ func publishNewestFirst(dir string, ss []model.Session, progress io.Writer) {
 	// them, and a line saying "3 empty transcripts" must count the whole
 	// corpus rather than this slice of it.
 	wasEmptied, wasCollisions, wasMerged := emptied.Load(), collisions.Load(), merged.Load()
-	err := writeSessions(tmp, dir, newest, nil, "")
+	err := writeSessionsWithSync(tmp, dir, newest, nil, "", importedState{compactions: compactionsForRebuild(dir, readTombstones()), partialOf: distinctSessions(ss)})
 	emptied.Store(wasEmptied)
 	collisions.Store(wasCollisions)
 	merged.Store(wasMerged)
@@ -1673,6 +1748,16 @@ func publishNewestFirst(dir string, ss []model.Session, progress io.Writer) {
 	if progress != nil {
 		fmt.Fprintf(progress, "deja: searchable now with the %d most recent sessions while the rest is indexed\n", len(newest))
 	}
+}
+
+// distinctSessions counts the sessions ss names, the way the build keys them:
+// a transcript read twice is one session, not two.
+func distinctSessions(ss []model.Session) int {
+	seen := make(map[string]struct{}, len(ss))
+	for _, s := range ss {
+		seen[s.Harness+":"+s.ID] = struct{}{}
+	}
+	return len(seen)
 }
 
 // partialPublishFrom is the corpus size at which the wait is worth a second
@@ -1725,11 +1810,12 @@ func writeSessionsWithSync(tmp, dir string, ss []model.Session, files map[string
 	writtenMessages := 0
 	lastIngestFiles = len(files)
 	parsedThisPass(files)
-	m := Manifest{Version: version, KeptDated: true, Format: onDiskFormat, Files: files, Sessions: map[string]SessionMeta{}, BuiltAt: time.Now(), SourcesReadAt: time.Now(), ReadZone: zoneFingerprint(), Generation: time.Now().UTC().Format(time.RFC3339Nano), Scope: scope,
+	m := Manifest{Version: version, KeptDated: true, Format: onDiskFormat, SearchOnly: searchOnlyFor(dir), Files: files, Sessions: map[string]SessionMeta{}, BuiltAt: time.Now(), SourcesReadAt: time.Now(), ReadZone: zoneFingerprint(), Generation: time.Now().UTC().Format(time.RFC3339Nano), Scope: scope,
 		ExportWatermarks: imp.watermarks, ExportBoundary: imp.boundary, ImportedRecords: imp.dedupe,
 		Compactions:        imp.compactions,
 		ExcludeFingerprint: sources.ExclusionFingerprint(),
-		ToolFingerprint:    mergedToolFingerprint(priorToolFingerprint(dir))}
+		ToolFingerprint:    mergedToolFingerprint(priorToolFingerprint(dir)),
+		PartialOf:          imp.partialOf}
 	recPath := filepath.Join(tmp, "records.bin")
 	rf, err := os.OpenFile(recPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
@@ -1850,17 +1936,19 @@ func writeSessionsWithSync(tmp, dir string, ss []model.Session, files map[string
 	// touched and ran. On a real store that is eight seconds of a twenty-second
 	// build, and it used to run under the previous phase's last percentage, so
 	// the bar sat still through it (#3372).
-	reportPhase("mining fixes and commands", 5)
-	buildCooccur(tmp, ss)
-	reportAdvance(1)
-	buildFixes(tmp, ss, func(s model.Session) string { return s.Harness + ":" + s.ID })
-	reportAdvance(1)
-	buildCommands(tmp, ss)
-	reportAdvance(1)
-	buildCommandFails(tmp, ss)
-	reportAdvance(1)
-	buildSessionFacts(tmp, ss)
-	reportAdvance(1)
+	if !m.SearchOnly {
+		reportPhase("mining fixes and commands", 5)
+		buildCooccur(tmp, ss)
+		reportAdvance(1)
+		buildFixes(tmp, ss, func(s model.Session) string { return s.Harness + ":" + s.ID })
+		reportAdvance(1)
+		buildCommands(tmp, ss)
+		reportAdvance(1)
+		buildCommandFails(tmp, ss)
+		reportAdvance(1)
+		buildSessionFacts(tmp, ss)
+		reportAdvance(1)
+	}
 	reportPhase("writing index", sp.bucketCount())
 	if err := sp.writeBuckets(filepath.Join(tmp, "buckets")); err != nil {
 		return err
@@ -3942,10 +4030,12 @@ func fullyReadFiles(changed, old map[string]FileState) map[string]FileState {
 // files this pass will re-read arrive with their clip count zeroed — the pass
 // records its own as it goes, and adding it to what the last pass found counted
 // one long message twice.
-func copyIngestFiles(old map[string]FileIngest, reread map[string]FileState) map[string]FileIngest {
+func copyIngestFiles(old map[string]FileIngest, reread map[string]FileState, logTails map[string]map[string]bool) map[string]FileIngest {
 	out := make(map[string]FileIngest, len(old))
 	for p, e := range old {
-		if _, ok := reread[p]; ok {
+		if ids, ok := logTails[p]; ok {
+			e = clipsOutsideTail(e, ids)
+		} else if _, ok := reread[p]; ok {
 			e.Clipped = 0
 			e.ClippedSessions = nil
 		} else {
@@ -3966,7 +4056,7 @@ func copyIngestFiles(old map[string]FileIngest, reread map[string]FileState) map
 // passing through updateIndex at all, and which forget and unforget call for
 // themselves.
 func beginPass() {
-	sources.DiagSnapshot()
+	sources.DiagBeginPass()
 	passParsed = nil
 	passRead = nil
 	passWholeStores = nil
@@ -4092,6 +4182,9 @@ func updateIndexPass(dir, harness, scope string, files map[string]FileState, for
 	old, err := readManifest(dir)
 	if err == nil && !recordsIntact(dir, old) {
 		force = true // records.bin lost its tail to a crash; only a rebuild is safe
+	}
+	if err == nil && miningChanged(old) {
+		force = true // search-only turned on or off: the sidecars go or come back whole
 	}
 	if err == nil && !force && newerIndex(old) {
 		sayNewerIndex(progress, dir, old)
@@ -4244,6 +4337,15 @@ func updateIndexPass(dir, harness, scope string, files map[string]FileState, for
 				unseen[p] = true
 			}
 			continue
+		} else if os.IsPermission(err) {
+			// Behind a directory this run may not enter: not deleted, and
+			// not outside the stores read either. The unreadable line names
+			// the directory (#5393).
+			if of, ok := old.Files[p]; ok {
+				files[p] = of
+				delete(removed, p)
+			}
+			continue
 		}
 		if !deletedFromLiveStore(p) {
 			continue
@@ -4325,12 +4427,15 @@ func updateIndexPass(dir, harness, scope string, files map[string]FileState, for
 		lastIngestFiles = 0
 		// Nothing to read, but the kept mark has to land, or the next run
 		// takes the same file for a fresh deletion.
-		if len(newlyKept) > 0 || !dated || len(touched) > 0 {
+		if len(newlyKept) > 0 || !dated || len(touched) > 0 || !unreadableCurrent(old, files) {
 			for p := range newlyKept {
 				old.Files[p] = files[p]
 			}
 			for p := range touched {
 				old.Files[p] = files[p]
+			}
+			if !unreadableCurrent(old, files) {
+				mergeIngestDiag(&old)
 			}
 			return writeManifestOnly(dir, old)
 		}
@@ -4377,6 +4482,7 @@ func updateIndexPass(dir, harness, scope string, files map[string]FileState, for
 		}
 	}
 	rereadSharedCopies(removed, changed, files, old.Sessions)
+	rereadPromptLogs(removed, changed, files, old.Files, old.Sessions)
 	var replacements []model.Session
 	// This pass's counts, like every other build path (#1850).
 	emptied.Store(0)
@@ -4392,7 +4498,9 @@ func updateIndexPass(dir, harness, scope string, files map[string]FileState, for
 	// A live-locked or half-written store (Cursor holds its sqlite under WAL)
 	// must not fail every search. Keep the old records and the old FileState
 	// so the next run retries this file.
+	logTails := promptLogTails(changed, old.Files, old.IngestFiles)
 	skip := func(p string, err error) {
+		delete(logTails, p)
 		if progress != nil {
 			fmt.Fprintf(progress, "deja: skipping %s this pass: %v\n", filepath.Base(p), err)
 		}
@@ -4424,6 +4532,9 @@ func updateIndexPass(dir, harness, scope string, files map[string]FileState, for
 		if err != nil {
 			skip(p, err)
 			return
+		}
+		if ids, ok := logTails[p]; ok {
+			ss = sessionsNamed(ss, widenLogTail(ids, p, ss, old.Sessions))
 		}
 		if harnessForPath(p) == "opencode" {
 			for _, s := range ss {
@@ -4614,7 +4725,7 @@ func updateIndexPass(dir, harness, scope string, files map[string]FileState, for
 	// keyed on it — the embedding sidecar — that the file it measured was still
 	// there (#1357). Only appendIncremental, which appends in place, may keep a
 	// generation.
-	m := Manifest{Version: version, KeptDated: true, Format: onDiskFormat, Files: files, Sessions: map[string]SessionMeta{}, BuiltAt: time.Now(), SourcesReadAt: time.Now(), ReadZone: zoneFingerprint(),
+	m := Manifest{Version: version, KeptDated: true, Format: onDiskFormat, SearchOnly: searchOnlyFor(dir), Files: files, Sessions: map[string]SessionMeta{}, BuiltAt: time.Now(), SourcesReadAt: time.Now(), ReadZone: zoneFingerprint(),
 		Generation: time.Now().UTC().Format(time.RFC3339Nano), Scope: scope,
 		ExportWatermarks: old.ExportWatermarks, ExportBoundary: old.ExportBoundary, ImportedRecords: old.ImportedRecords,
 		Compactions: cloneCompactions(old.Compactions),
@@ -4628,7 +4739,7 @@ func updateIndexPass(dir, harness, scope string, files map[string]FileState, for
 		// doctor forgot a store's unreadable file because an unrelated
 		// transcript changed (#2015). A store this pass re-read starts over,
 		// because a file rewritten clean has to be able to clear its count.
-		IngestFiles: copyIngestFiles(old.IngestFiles, reread)}
+		IngestFiles: copyIngestFiles(old.IngestFiles, reread, logTails)}
 	skipRedactions := map[string]bool{}
 	for p := range changed {
 		skipRedactions[p] = true
@@ -4648,6 +4759,9 @@ func updateIndexPass(dir, harness, scope string, files map[string]FileState, for
 	// After the redaction, so the texts compare with what the records hold.
 	compacted := compactedInPlace(replacements, false)
 	buckets := bucketPostings{}
+	// Every record's offset in the new log, as it is written: the table the
+	// commit would otherwise build by walking the whole log again (#5402).
+	offsets := &passOffsets{byKey: map[string][]int64{}}
 	addRec := func(r Record) error {
 		if r.SourcePath == "" {
 			return nil
@@ -4659,14 +4773,13 @@ func updateIndexPass(dir, harness, scope string, files map[string]FileState, for
 		if !ok {
 			return nil
 		}
-		// Carried records were redacted when first written; re-running the
-		// regex battery over the whole corpus made every incremental update
-		// cost O(index), which is what a live cline/cursor store hits on
-		// each change.
 		off, err := rw.write(r)
 		if err != nil {
 			return err
 		}
+		offsets.add(r.Key, off)
+		passEncoded.Add(1)
+		passKeyed.Add(1)
 		// The same part and the same tool bit a full build gives the record.
 		// Tokenizing the whole text here put every hash of a written side,
 		// every replaced span's body and whole build logs into the postings
@@ -4680,16 +4793,31 @@ func updateIndexPass(dir, harness, scope string, files map[string]FileState, for
 		m.Sessions[r.Key] = meta
 		return nil
 	}
-	var recErr error
 	// The sessions that lost a record here, which the command failure walk
 	// has to read again along with the ones re-read (#4288).
 	dropped := map[string]bool{}
 	// Seeded with the records carried for a session this pass replaces, so a
 	// turn a kept or skipped copy already holds is not written again.
 	seenMsgs := msgSeen{}
-	if err := eachRecord(filepath.Join(dir, "records.bin"), tablesFromManifest(old), func(r Record) {
-		if recErr != nil {
-			return
+	// Carried records were redacted, encoded and keyed when first written.
+	// Each is copied as it is stored, and its postings are moved over below:
+	// doing it all again made every replacement pass cost the whole store, on
+	// one core (#5383). Only a session this pass replaces, or one a compaction
+	// may have kept, has its body read.
+	oldTables := tablesFromManifest(old)
+	carried := &carriedRecords{}
+	if err := eachStoredRecord(filepath.Join(dir, "records.bin"), func(oldOff int64, payload []byte) error {
+		kid, pid, rid, rest, ok := recordPrefix(payload)
+		if !ok {
+			return errShortRecord
+		}
+		r := Record{Key: oldTables.lookup(kid), SourcePath: oldTables.lookup(pid), Role: oldTables.lookup(rid)}
+		if _, ok := compacted[r.Key]; ok || replaceKeys[r.Key] {
+			full, err := decodeRecord(payload, oldTables)
+			if err != nil {
+				return err
+			}
+			r = full
 		}
 		// Shared-store harnesses (opencode, cursor) are parsed since a
 		// watermark, so their untouched sessions are NOT re-emitted on a
@@ -4708,24 +4836,35 @@ func updateIndexPass(dir, harness, scope string, files map[string]FileState, for
 		// And only when the pass read that store whole: a store read from its
 		// watermark hands back the new turns alone, so dropping the rest by key
 		// would take the earlier turns of every continued session (#2033).
-		if removed[r.SourcePath] || (changed[r.SourcePath].Path != "" && !fromStore && !leftItsFile(r, replaceKeys, old.Sessions[r.Key], aiderHeld) && !keptThroughCompaction(r, compacted)) || (fromStore && readWholeThisPass(r) && storeKeys[r.Key]) ||
+		if removed[r.SourcePath] || (changed[r.SourcePath].Path != "" && !fromStore && !keptFromLogTail(r, logTails) && !leftItsFile(r, replaceKeys, old.Sessions[r.Key], aiderHeld) && !keptThroughCompaction(r, compacted)) || (fromStore && readWholeThisPass(r) && storeKeys[r.Key]) ||
 			(takeovers[r.Key] && isCodexHistory(r.SourcePath)) {
 			dropped[r.Key] = true
-			return
+			return nil
 		}
 		if r.SourcePath == "" {
-			dropped[r.Key] = true // addRec does not carry it
-		} else if replaceKeys[r.Key] {
+			dropped[r.Key] = true // not carried
+			return nil
+		}
+		if replaceKeys[r.Key] {
 			seenMsgs.dup(r.Key, r.Role, r.Time, r.Text)
 		}
-		recErr = addRec(r)
+		meta, ok := old.Sessions[r.Key]
+		if !ok {
+			return nil
+		}
+		off, err := rw.writeStored(r.Key, r.SourcePath, r.Role, rest)
+		if err != nil {
+			return err
+		}
+		carried.add(oldOff, off, meta.Ord, isToolRole(r.Role))
+		offsets.add(r.Key, off)
+		if _, exists := m.Sessions[r.Key]; !exists {
+			m.Sessions[r.Key] = meta
+		}
+		return nil
 	}); err != nil {
 		_ = rw.Close()
 		return err
-	}
-	if recErr != nil {
-		_ = rw.Close()
-		return recErr
 	}
 	// Ord is the posting's session id, so two sessions sharing one merges
 	// their postings. A replacement reclaims its Ord from the OLD manifest,
@@ -4808,19 +4947,32 @@ func updateIndexPass(dir, harness, scope string, files map[string]FileState, for
 	if err := rw.Close(); err != nil {
 		return err
 	}
-	if err := writeBucketsConcurrent(filepath.Join(tmp, "buckets"), buckets); err != nil {
+	moved, err := carriedPostings(dir, old, carried)
+	if err != nil {
+		return err
+	}
+	mergePostings(moved, buckets)
+	if err := writeBucketsConcurrent(filepath.Join(tmp, "buckets"), moved); err != nil {
 		return err
 	}
 	settleCopies(&m, old.Sessions, changed, replacements)
 	setDatabaseStoreWatermarks(m.Files, m.Sessions)
 	m.RecordStrings = tbl.strs
-	// Ahead of the commit, which checks its entries against the new log
-	// rather than parsing every session that carries a wall again.
-	if b, err := os.ReadFile(filepath.Join(dir, frictionTextsFile)); err == nil {
-		_ = os.WriteFile(filepath.Join(tmp, frictionTextsFile), b, 0o600)
+	_ = offsets.write(tmp)
+	// The sessions this pass read again or dropped a record of. Everything
+	// else was copied as stored, in its order, so what was derived from its
+	// records still holds.
+	for key := range replaceKeys {
+		dropped[key] = true
 	}
+	// Ahead of the commit, which then reads only the sessions that changed
+	// rather than parsing every session that carries a wall again.
+	carryFrictionTexts(dir, tmp, old, dropped)
 	if err := writeManifest(tmp, m); err != nil {
 		return err
+	}
+	if m.SearchOnly {
+		return swapIndexDir(dir, tmp)
 	}
 	carrySidecars(dir, tmp)
 	// After carrying, not instead of it: the fixes merge writes only when it
@@ -4829,9 +4981,6 @@ func updateIndexPass(dir, harness, scope string, files map[string]FileState, for
 	// carried file, as a full build would not write it (#4441).
 	mergeFixes(dir, tmp, sessionKeys(m), replacements, replaceKeys)
 	buildCommandsFromIndex(tmp)
-	for key := range replaceKeys {
-		dropped[key] = true
-	}
 	buildCommandFailsFromIndex(tmp, carriedCommandFailState(dir, old, tmp, m.Generation, dropped), dropped)
 	buildSessionFactsFromIndex(tmp)
 	return swapIndexDir(dir, tmp)
@@ -5320,6 +5469,9 @@ func appendIncremental(dir, harness, scope string, old Manifest, files map[strin
 	// Read before writeManifest: the fold in there drains the counters, and the
 	// caller prints its line after this returns (#2007).
 	unreadable = totalMalformed()
+	// A pass that recorded files is past a first build's early slice; what
+	// is still missing is what the next walk finds unread.
+	m.PartialOf = 0
 	if err := writeManifest(dir, m); err != nil {
 		return filesTouched, messages, unreadable, err
 	}
@@ -5331,6 +5483,9 @@ func appendIncremental(dir, harness, scope string, old Manifest, files map[strin
 	// whole, so a pair that starts before the tail is found; the rest of the
 	// table is still earned, and a candidate on file is what a second sighting
 	// needs to be promoted.
+	if m.SearchOnly {
+		return filesTouched, messages, unreadable, nil
+	}
 	whole, rewhole := wholeSessionsForFixes(dir, m, appended)
 	mergeFixes(dir, dir, nil, whole, rewhole)
 	// The two command tables are mined from every record the index holds, which
@@ -5483,7 +5638,12 @@ func walStat(p string) (size, stamp int64) {
 
 // kindForPath returns the registry FileKind whose Match accepts p.
 func kindForPath(p string) (sources.FileKind, bool) {
-	for _, h := range sources.Registry() {
+	return kindIn(sources.Registry(), p)
+}
+
+// kindIn is kindForPath against a registry already built.
+func kindIn(reg []sources.Harness, p string) (sources.FileKind, bool) {
+	for _, h := range reg {
 		for _, k := range h.Kinds {
 			if k.Match(p) {
 				return k, true
@@ -5498,7 +5658,7 @@ func parseChangedFile(harness, p string, old FileState) ([]model.Session, error)
 	if !ok {
 		return nil, nil
 	}
-	return k.Parse(p, old.LastUpdated)
+	return sources.ReadWatched(p, func() ([]model.Session, error) { return k.Parse(p, old.LastUpdated) })
 }
 
 func parseAppendedFile(harness, p string, old FileState, isNew bool) (ss []model.Session, err error) {
@@ -5518,9 +5678,9 @@ func parseAppendedFile(harness, p string, old FileState, isNew bool) (ss []model
 		if !isNew || k.Parse == nil {
 			return nil, nil
 		}
-		return k.Parse(p, 0)
+		return sources.ReadWatched(p, func() ([]model.Session, error) { return k.Parse(p, 0) })
 	}
-	return k.ParseFrom(p, resumeOffset(old), old.LastUpdated)
+	return sources.ReadWatched(p, func() ([]model.Session, error) { return k.ParseFrom(p, resumeOffset(old), old.LastUpdated) })
 }
 
 // harnessForPath reports the fine-grained source kind for a path (claude,
@@ -5879,8 +6039,14 @@ func currentFilesWith(h string, old map[string]FileState) map[string]FileState {
 	// way" surface reported an ordinary quiet day until the walk finished
 	// (#1021).
 	reportPhase("finding transcripts", 0)
+	sources.BeginWalk()
+	defer func() { setLastWalkFailed(sources.WalkFailures()) }()
 	paths := map[string]bool{}
-	for _, hr := range sources.Registry() {
+	// The stores a rebuild reads, not every store: an excluded harness was
+	// walked and indexed here on every incremental pass (#5394). Its rows in
+	// the manifest are kept as a store outside this run's view, so what is
+	// already indexed stays until a rebuild, as with a project pattern.
+	for _, hr := range sources.StoresToRead() {
 		if h != "" && h != hr.Name {
 			continue
 		}
@@ -5888,18 +6054,215 @@ func currentFilesWith(h string, old map[string]FileState) map[string]FileState {
 			paths[p] = true
 		}
 	}
-	out := map[string]FileState{}
-	for p := range paths {
-		if fi, err := os.Lstat(p); err == nil && fi.Mode()&os.ModeSymlink == 0 && !fi.IsDir() {
-			out[p] = walkFileState(p, fi, old)
-		}
-	}
+	out := statFiles(paths, old)
 	injectHermesPG(out, old)
+	noteLockedAway(h, out, old)
 	return out
 }
 
+// noteLockedAway names an indexed transcript the walk did not list because a
+// directory above it now refuses this run. A store that lists its files with
+// a glob drops the refusal on the floor, and the transcript then read as gone
+// (#5393). Once per directory the walk already named. One Lstat per directory:
+// whether a file can be statted is decided by the directories above it.
+func noteLockedAway(h string, out, old map[string]FileState) {
+	if h != "" {
+		return
+	}
+	var failed map[string]string
+	denied := map[string]bool{}
+	for p, f := range old {
+		if _, ok := out[p]; ok || f.Kept || p == syncImportPath || sources.OutsideStoresRead(p) {
+			continue
+		}
+		d := filepath.Dir(p)
+		locked, seen := denied[d]
+		if !seen {
+			locked = behindLockedDir(p)
+			denied[d] = locked
+		}
+		if !locked {
+			continue
+		}
+		if failed == nil {
+			failed = sources.WalkFailures()
+		}
+		named := false
+		for ; d != filepath.Dir(d); d = filepath.Dir(d) {
+			if failed[d] != "" {
+				named = true
+				break
+			}
+		}
+		if !named {
+			sources.NoteUnreadable(p)
+		}
+	}
+}
+
+// lastWalkFailed is what the latest store walk could not read: directories it
+// could not list and transcripts whose mode refuses a read.
+var (
+	lastWalkMu     sync.Mutex
+	lastWalkFailed map[string]string
+)
+
+func setLastWalkFailed(m map[string]string) {
+	lastWalkMu.Lock()
+	lastWalkFailed = m
+	lastWalkMu.Unlock()
+}
+
+func walkFailed() map[string]string {
+	lastWalkMu.Lock()
+	defer lastWalkMu.Unlock()
+	return lastWalkFailed
+}
+
+// unreadableCurrent reports whether the manifest's unreadable paths are the
+// ones the latest walk saw. A chmod changes no size or mtime, and a directory
+// that cannot be listed adds no file, so the walk alone called the index up to
+// date and nothing ever said part of the history was not being read (#5393).
+// Only paths with a recorded error are looked at, so the walk costs no more.
+func unreadableCurrent(m Manifest, files map[string]FileState) bool {
+	failed := walkFailed()
+	for p := range failed {
+		if m.IngestFiles[p].Error == "" {
+			return false
+		}
+	}
+	for p, e := range m.IngestFiles {
+		if e.Error == "" || failed[p] != "" {
+			continue
+		}
+		if f, ok := files[p]; ok {
+			if of, held := m.Files[p]; e.Walk && held && sameFile(of, f) {
+				return false
+			}
+			continue
+		}
+		if gone(p) {
+			return false
+		}
+		if _, held := m.Files[p]; !held && dirListable(p) {
+			return false
+		}
+	}
+	return true
+}
+
+// behindLockedDir reports an indexed file the walk did not list because a
+// directory above it refuses this run, rather than because it went away.
+func behindLockedDir(p string) bool {
+	_, err := os.Lstat(p)
+	return os.IsPermission(err)
+}
+
+// gone reports a path that is no longer there at all: a transcript the walk
+// once could not read, deleted since, has nothing left to report.
+func gone(p string) bool {
+	_, err := os.Lstat(p)
+	return errors.Is(err, fs.ErrNotExist)
+}
+
+// dirListable reports a directory that lists now. Only a directory is
+// opened: the path may be a transcript that failed to read.
+func dirListable(p string) bool {
+	if fi, err := os.Lstat(p); err != nil || !fi.IsDir() {
+		return false
+	}
+	f, err := os.Open(p)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = f.Close() }()
+	if fi, err := f.Stat(); err != nil || !fi.IsDir() {
+		return false
+	}
+	_, err = f.Readdirnames(1)
+	return err == nil || errors.Is(err, io.EOF)
+}
+
+// statFiles is the walk's FileState for each path that is a regular file.
+//
+// Every search stats each transcript to learn nothing moved: 12k files on the
+// store in #5386. The files are independent, so a few workers share them; the
+// result is the same map either way.
+func statFiles(paths map[string]bool, old map[string]FileState) map[string]FileState {
+	list := make([]string, 0, len(paths))
+	for p := range paths {
+		list = append(list, p)
+	}
+	states := make([]FileState, len(list))
+	isFile := make([]bool, len(list))
+	reg := sources.Registry()
+	stat := func(i int) {
+		p := list[i]
+		fi, err := os.Lstat(p)
+		if os.IsPermission(err) {
+			// Listed by a directory this run may read but not enter.
+			sources.NoteUnreadable(p)
+			return
+		}
+		if err == nil && fi.Mode()&os.ModeSymlink == 0 && !fi.IsDir() {
+			// Listed all the same: a file this run may not read is not a
+			// deleted one, and the sessions already read from it stay.
+			if sources.ModeUnreadable(p, fi) {
+				sources.NoteUnreadable(p)
+			}
+			states[i], isFile[i] = walkFileStateIn(reg, p, fi, old), true
+		}
+	}
+	workers := min(runtime.GOMAXPROCS(0), statWorkers, len(list)/statPerWorker)
+	if workers <= 1 {
+		for i := range list {
+			stat(i)
+		}
+	} else {
+		var next atomic.Int64
+		var wg sync.WaitGroup
+		for w := 0; w < workers; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for {
+					i := int(next.Add(1)) - 1
+					if i >= len(list) {
+						return
+					}
+					stat(i)
+				}
+			}()
+		}
+		wg.Wait()
+	}
+	out := make(map[string]FileState, len(list))
+	for i, p := range list {
+		if isFile[i] {
+			out[p] = states[i]
+		}
+	}
+	return out
+}
+
+// statWorkers caps the walk's workers: on 12k files four took the walk from
+// 55 ms to 28 ms and eight did no better. statPerWorker is the fewest files
+// worth starting one for.
+const (
+	statWorkers   = 4
+	statPerWorker = 256
+)
+
 // walkFileState is what the walk records for a transcript file.
 func walkFileState(p string, fi os.FileInfo, old map[string]FileState) FileState {
+	return walkFileStateIn(sources.Registry(), p, fi, old)
+}
+
+// walkFileStateIn is walkFileState against a registry the caller built once.
+// Building it is most of what the walk spent per file, twice over — once to
+// find the file's kind, once to name its harness — and a walk visits every
+// transcript on the machine (#5386).
+func walkFileStateIn(reg []sources.Harness, p string, fi os.FileInfo, old map[string]FileState) FileState {
 	fs := FileState{Path: p, Size: fi.Size(), MTime: fi.ModTime().UnixNano()}
 	if strings.HasSuffix(p, ".jsonl") {
 		// Deriving these means reading the file: the tail for the last
@@ -5911,15 +6274,38 @@ func walkFileState(p string, fi os.FileInfo, old map[string]FileState) FileState
 			fs.PrefixSample = of.PrefixSample
 			fs.WrittenBack = of.WrittenBack
 		} else {
-			fs.SafeSize = lastCompleteLineOffset(p, fi.Size())
-			fs.PrefixSample = filePrefixSample(p, fs.SafeSize)
+			// Under the store read budget: the walk reads the tail and the
+			// head of a changed transcript, and a file on a mount that stopped
+			// answering held the run in "finding transcripts" (#5396).
+			type ends struct {
+				safe   int64
+				sample uint64
+			}
+			e, err := sources.Watch(p, func() (ends, error) {
+				safe := lastCompleteLineOffset(p, fi.Size())
+				return ends{safe, filePrefixSample(p, safe)}, nil
+			})
+			if err != nil {
+				// 0 is "not known": the next pass reads the file whole
+				// rather than resuming from a guess.
+				sources.NoteWalkError(p, err)
+				e = ends{}
+			}
+			fs.SafeSize, fs.PrefixSample = e.safe, e.sample
 		}
 	}
-	if k, ok := kindForPath(p); ok && k.Sidecar != nil {
+	k, ok := kindIn(reg, p)
+	if ok && k.Sidecar != nil {
 		fs.MetadataSize, fs.MetadataMTime = k.Sidecar(p)
 	}
 	fs.WALSize, fs.WALMTime = walStat(p)
-	if harnessForPath(p) == "grok" {
+	// The kind's name is what harnessForPath answers for a path it matched;
+	// only a path no kind claims goes on to its probe names.
+	harness := k.Name
+	if !ok {
+		harness = harnessForPath(p)
+	}
+	if harness == "grok" {
 		if cwd, err := os.Lstat(filepath.Join(filepath.Dir(filepath.Dir(p)), ".cwd")); err == nil && cwd.Mode()&os.ModeSymlink == 0 && !cwd.IsDir() {
 			fs.CWDSize = cwd.Size()
 			fs.CWDMTime = cwd.ModTime().UnixNano()
@@ -5936,7 +6322,7 @@ func walkFileState(p string, fi os.FileInfo, old map[string]FileState) FileState
 // sessions must not be dropped as if forgotten.
 func injectHermesPG(out, old map[string]FileState) {
 	dsn := sources.HermesPGDSN()
-	if dsn == "" {
+	if dsn == "" || !sources.StoreRead("hermes") {
 		for p, of := range old {
 			if sources.IsHermesPGStore(p) {
 				out[p] = of

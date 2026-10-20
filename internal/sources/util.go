@@ -321,16 +321,15 @@ func leadingJSONLHeader(path string, offset int64, lookahead int, isHeader func(
 		return nil
 	}
 	defer f.Close()
-	r := bufio.NewReaderSize(io.LimitReader(f, offset), 1024*1024)
+	r := bufio.NewReaderSize(io.LimitReader(f, offset), jsonlBuffer)
 	for range lookahead {
-		line, err := r.ReadBytes('\n')
-		if line = trimJSONSpace(line); len(line) > 0 {
-			var m map[string]any
-			d := json.NewDecoder(strings.NewReader(string(line)))
-			d.UseNumber()
-			if d.Decode(&m) == nil && isHeader(m) {
-				return m
-			}
+		l, err := readJSONLine(r)
+		m, ok := l.m, l.ok
+		if !l.long {
+			m, ok, _ = decodeJSONObjectLine(l.raw)
+		}
+		if ok && isHeader(m) {
+			return m
 		}
 		if err != nil {
 			return nil
@@ -385,9 +384,9 @@ func boundedFrom(path string, f *os.File, offset int64) io.Reader {
 	e, ok := readEnds[path]
 	readEndsMu.Unlock()
 	if !ok {
-		return f
+		return watchedReader(path, f)
 	}
-	return io.LimitReader(f, max(e.size-offset, 0))
+	return watchedReader(path, io.LimitReader(f, max(e.size-offset, 0)))
 }
 
 func scanJSONLFromOffset(path string, offset int64, fn func(map[string]any)) error {
@@ -408,23 +407,20 @@ func scanJSONLFromOffset(path string, offset int64, fn func(map[string]any)) err
 // path only names the file in diagnostics. A decompressed archive is read
 // through it from memory, so its plaintext never lands in a temporary file.
 func scanJSONLReader(path string, src io.Reader, fn func(map[string]any)) error {
-	r := bufio.NewReaderSize(src, 1024*1024)
+	r := bufio.NewReaderSize(src, jsonlBuffer)
 	for {
-		line, err := r.ReadBytes('\n')
-		// A UTF-8 BOM on the first line would fail the JSON decode below, so the
-		// opening turn was dropped; trimJSONSpace strips it (and surrounding
-		// space) the way the claude decode path already does.
-		if line = trimJSONSpace(line); len(line) > 0 {
-			var m map[string]any
-			d := json.NewDecoder(strings.NewReader(string(line)))
-			d.UseNumber()
-			if d.Decode(&m) == nil {
-				fn(m)
-			} else if err == nil {
-				// A last line with no newline yet is the client still
-				// writing it; the next pass reads it whole (#4276).
-				diagMalformedLine(path)
-			}
+		l, err := readJSONLine(r)
+		m, ok, empty := l.m, l.ok, l.empty
+		if !l.long {
+			m, ok, empty = decodeJSONObjectLine(l.raw)
+		}
+		// A last line with no newline that does not decode is the client
+		// still writing it; the next pass reads it whole (#4276).
+		switch {
+		case ok:
+			fn(m)
+		case !empty && l.ended:
+			diagMalformedLine(path)
 		}
 		if errors.Is(err, io.EOF) {
 			return nil
@@ -433,6 +429,27 @@ func scanJSONLReader(path string, src io.Reader, fn func(map[string]any)) error 
 			return err
 		}
 	}
+}
+
+// decodeJSONObjectLine decodes a line holding one JSON object, numbers kept as
+// json.Number. A line holding anything else is not one: a null, or an object
+// with more after it, was handed on as a record, or as nothing, and went
+// uncounted (#5391).
+func decodeJSONObjectLine(line []byte) (m map[string]any, ok, empty bool) {
+	// A UTF-8 BOM on the first line would fail the decode, so the opening
+	// turn was dropped; trimJSONSpace strips it and the space around.
+	if line = trimJSONSpace(line); len(line) == 0 {
+		return nil, false, true
+	}
+	d := json.NewDecoder(bytes.NewReader(line))
+	d.UseNumber()
+	if d.Decode(&m) != nil || m == nil {
+		return nil, false, false
+	}
+	if _, err := d.Token(); !errors.Is(err, io.EOF) {
+		return nil, false, false
+	}
+	return m, true, false
 }
 
 // keepRegular drops any path that is not a regular file. Discovery paths that
@@ -503,7 +520,7 @@ func walkFiles(root string, pred func(string) bool) []string {
 			// to say: the only sign was a file count nobody has memorised
 			// (#816, and the ingest half of it #818).
 			if os.IsPermission(err) {
-				diagFileError(p, err)
+				diagWalkError(p, err)
 			}
 			return nil
 		}
@@ -556,7 +573,7 @@ func parseFiles(files []string, parse func(string) ([]model.Session, error)) []m
 		go func() {
 			defer wg.Done()
 			for j := range jobs {
-				ss, err := safeParse(j.p, parse)
+				ss, err := ReadWatched(j.p, func() ([]model.Session, error) { return safeParse(j.p, parse) })
 				diagFileError(j.p, err)
 				fileParsed(j.p)
 				outs <- struct {
@@ -1087,6 +1104,15 @@ func fileParsed(path string) {
 // order mark some Windows tools write: json.Unmarshal refuses the mark, and the
 // whole session went for three bytes. trimJSONSpace does the same for a line.
 func readJSONFile(path string) ([]byte, error) {
-	b, err := os.ReadFile(path)
-	return bytes.TrimPrefix(b, []byte("\xef\xbb\xbf")), err
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+	var buf bytes.Buffer
+	if fi, err := f.Stat(); err == nil && fi.Size() > 0 {
+		buf.Grow(int(fi.Size()) + bytes.MinRead)
+	}
+	_, err = buf.ReadFrom(watchedReader(path, f))
+	return bytes.TrimPrefix(buf.Bytes(), []byte("\xef\xbb\xbf")), err
 }

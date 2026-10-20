@@ -61,6 +61,11 @@ func main() {
 	if exe, exeErr := os.Executable(); exeErr == nil {
 		notice.finish(os.Stderr, exe)
 	}
+	var status exitStatus
+	if errors.As(err, &status) {
+		stopProfiling()
+		os.Exit(int(status))
+	}
 	if err != nil {
 		stopProfiling()
 		// Already said, on stderr, in the words that fit what happened: a
@@ -502,6 +507,18 @@ func cmdWarmup(dir string, rest []string) error {
 		}
 		return fmt.Errorf("warmup takes no arguments — got %q", a)
 	}
+	// warmup is what hooks and installs start; with automatic indexing off
+	// it reports the index instead of building it (#5385).
+	if index.Manual() {
+		if err := index.ManualStatus(dir); err != nil {
+			return err
+		}
+		if line := manualIndexLine(dir); line != "" {
+			fmt.Fprintln(os.Stderr, line)
+		}
+		_, _ = writeCLISkill()
+		return nil
+	}
 	stop := publishBuildProgress(dir)
 	defer stop()
 	prepareFirstIndexGreeting(dir)
@@ -562,6 +579,18 @@ func cmdIndex(dir string, rest []string) error {
 			return unknownFlag("index", a, indexFlags)
 		}
 	}
+	// The detached warmup runs this command too. With automatic indexing off
+	// it is not the user asking, so it writes nothing; anything else here is
+	// the explicit build the switch leaves on (#5385).
+	if os.Getenv("DEJA_WARMUP_SENTINEL") != "" && index.Manual() {
+		clearWarmupSentinel()
+		return nil
+	}
+	defer index.AllowBuild()()
+	// Run by hand, it is also what turns search-only on or off (#5395).
+	if os.Getenv("DEJA_WARMUP_SENTINEL") == "" {
+		defer index.ApplySearchOnly()()
+	}
 	// Where the command reports that it worked. Nobody is watching a run out
 	// of a shell profile or a hook, and a line printed over the prompt on
 	// every new shell is the kind of thing that gets a tool uninstalled
@@ -611,13 +640,17 @@ func cmdIndex(dir string, rest []string) error {
 		clearWarmupSentinel()
 		fmt.Fprintf(said, "deja: index is up to date (%d session%s)\n", n, pluralS(n))
 		printRetentionDue(said, time.Now())
+		// Up to date with what it could read: a path it may not read is
+		// still missing from recall on every run, not only the one that
+		// found it (#5393).
+		unread := sayUnreadable(dir)
 		// "Up to date" is the most misleading place to stay quiet about it:
 		// nothing changed on disk, so this is exactly where an exclusion set
 		// after the build looks applied and is not.
 		if index.ExclusionsChanged(dir) {
 			fmt.Fprintln(os.Stderr, "deja: the exclude list changed since this index was built — `deja index --rebuild` applies it to sessions already indexed")
 		}
-		return nil
+		return partialIndex(unread, 0)
 	}
 	stopProgress()
 	if !quiet {
@@ -630,7 +663,19 @@ func cmdIndex(dir string, rest []string) error {
 	// command then owed a closing line and had none, leaving "waiting for it
 	// to finish" as the last thing on screen (#1751).
 	progress := &countingWriter{w: said}
-	build := func() error { return index.Ensure(dir, "", force, progress) }
+	// Piped or under cron there is no live display, and a long run printed
+	// "indexing ..." and then nothing until the per-store counts: one line
+	// per phase says where it is (#5396). Not for the warmup, which
+	// publishes its phases to the status file.
+	phases := !quiet && !logoWanted(os.Stdout) && os.Getenv("DEJA_WARMUP_SENTINEL") == ""
+	skippedBefore := index.SkippedThisRun()
+	build := func() error {
+		if phases {
+			index.SetPhaseLines(said)
+			defer index.SetPhaseLines(nil)
+		}
+		return index.Ensure(dir, "", force, progress)
+	}
 	draw := func() error { return withBuildProgress(build) }
 	if quiet {
 		// The live display paints the same progress the sink above is
@@ -665,20 +710,7 @@ func cmdIndex(dir string, rest []string) error {
 	// A store deja could not read loses its sessions from recall, and the index
 	// run is where someone is looking at the counts — doctor knowing about it
 	// is not the same as saying it here (#818).
-	for _, h := range sortedHarnesses(index.IngestHealth(dir)) {
-		e := index.IngestHealth(dir)[h]
-		if e.FailedFiles == 0 {
-			continue
-		}
-		// "deja: deja: 1 path could not be read" is the notes file, and reads
-		// like a stutter. It is the user's own writing, so it says so (#901).
-		name := h
-		if h == "deja" {
-			name = "your notes"
-		}
-		fmt.Fprintf(os.Stderr, "deja: %s: %d path%s could not be read — `deja doctor` names %s\n",
-			name, e.FailedFiles, pluralS(e.FailedFiles), pluralWhich(e.FailedFiles))
-	}
+	unread := sayUnreadable(dir)
 	// An exclusion applies at ingest, so it covers nothing already indexed —
 	// and the sequence someone actually performs is to set the pattern, run
 	// this command, and sync. That used to return silently having applied
@@ -737,7 +769,54 @@ func cmdIndex(dir string, rest []string) error {
 	if b := index.LastBuild; !b.Initial && b.Messages > 0 && logoWanted(os.Stdout) && os.Getenv("DEJA_WARMUP_SENTINEL") == "" {
 		fmt.Fprintf(said, "deja: indexed %d session%s, %d message%s%s\n", b.Sessions, pluralS(b.Sessions), b.Messages, pluralS(b.Messages), tookSuffix(b.Took))
 	}
+	return partialIndex(unread, index.SkippedThisRun()-skippedBefore)
+}
+
+// exitPartial is the status of a `deja index` that wrote the index but left
+// part of the input unread: a path it could not read, or lines it skipped in
+// what it read this run. A cron job or a timer could not tell that from a
+// clean run, because both exited 0 (#5396). 1 stays "the index was not
+// written"; 2 is left alone, since a hook host reads it as "block".
+const exitPartial = 3
+
+// exitStatus is an error that has already been said and carries the status
+// the process exits with.
+type exitStatus int
+
+func (e exitStatus) Error() string { return fmt.Sprintf("exit status %d", int(e)) }
+
+// partialIndex is the outcome of an index run that wrote the index: nil, or
+// exitPartial when something it was given was not read.
+func partialIndex(unreadable, skipped int) error {
+	if unreadable > 0 || skipped > 0 {
+		return exitStatus(exitPartial)
+	}
 	return nil
+}
+
+// sayUnreadable names, per store, the paths the index could not read. A store
+// deja could not read loses its sessions from recall, and the index run is
+// where someone is looking at the counts — doctor knowing about it is not the
+// same as saying it here (#818). Returns how many there were.
+func sayUnreadable(dir string) int {
+	health := index.IngestHealth(dir)
+	total := 0
+	for _, h := range sortedHarnesses(health) {
+		e := health[h]
+		if e.FailedFiles == 0 {
+			continue
+		}
+		total += e.FailedFiles
+		// "deja: deja: 1 path could not be read" is the notes file, and reads
+		// like a stutter. It is the user's own writing, so it says so (#901).
+		name := h
+		if h == "deja" {
+			name = "your notes"
+		}
+		fmt.Fprintf(os.Stderr, "deja: %s: %d path%s could not be read — `deja doctor` names %s\n",
+			name, e.FailedFiles, pluralS(e.FailedFiles), pluralWhich(e.FailedFiles))
+	}
+	return total
 }
 
 func cmdHookContext(dir string, rest []string) error {
@@ -1118,6 +1197,11 @@ func ctxFromIDPrefix(dir, q string) (bool, error) {
 		fmt.Fprintln(os.Stdout, line)
 	}
 	cw := &countingWriter{w: os.Stdout}
+	// The digest marks its own cuts; a message the index stored short is a
+	// cut made before it, and `deja show` says so the same way (#5392).
+	if line := clippedMessageNote(dir, s); line != "" {
+		fmt.Fprintln(os.Stderr, line)
+	}
 	search.PrintContextStyled(cw, s, "", search.ColorOK(os.Stdout), printableWidth(os.Stdout))
 	if blk := changesBlock(s, search.ContextBudget-cw.n); blk != "" {
 		fmt.Fprint(os.Stdout, "\n"+blk)
@@ -1260,6 +1344,9 @@ func cmdCtx(dir string, rest []string) error {
 		whole = full
 	}
 	cw := &countingWriter{w: os.Stdout}
+	if line := clippedMessageNote(dir, whole); line != "" {
+		fmt.Fprintln(os.Stderr, line)
+	}
 	search.PrintContextStyled(cw, whole, q, search.ColorOK(os.Stdout), printableWidth(os.Stdout))
 	if blk := changesBlock(whole, search.ContextBudget-cw.n); blk != "" {
 		fmt.Fprint(os.Stdout, "\n"+blk)
@@ -1565,13 +1652,18 @@ func cmdSearch(dir string, rest []string, sourceInstance string) error {
 // `--rebuild` still waits: someone who asked for the rebuild wants its result.
 func ensureForCLISearch(dir string, o search.Options, force bool, progress io.Writer) error {
 	if force {
+		// Asked for by hand, so it builds with automatic indexing off too.
+		defer index.AllowBuild()()
 		return index.EnsureForSearch(dir, o, true, progress)
 	}
-	stale, err := index.EnsureForSearchStale(dir, o, progress)
+	cov, err := index.EnsureForSearchCoverage(dir, o, progress)
 	if err != nil {
 		return err
 	}
-	if stale {
+	if line := manualIndexLine(dir); line != "" && progress != io.Discard {
+		saidManualIndex.Do(func() { fmt.Fprintln(progress, line) })
+	}
+	if cov.Stale {
 		requestWarmup(dir)
 		// Only when there is an index to answer from. On a first build there is
 		// not, and the two lines contradicted each other on the worst run to
@@ -1579,7 +1671,7 @@ func ensureForCLISearch(dir string, o search.Options, force bool, progress io.Wr
 		// from the index as it was" and then "the index is being rebuilt right
 		// now, run this again in a moment" (#3574).
 		if index.ReadableSnapshot(dir) {
-			fmt.Fprintln(progress, "deja: answering from the index as it was — refreshing in the background")
+			fmt.Fprintln(progress, "deja: "+coverageLine(cov))
 		}
 	}
 	return nil
@@ -2858,16 +2950,24 @@ func findByPrefixHarness(dir, p, harness string) (model.Session, bool, error) {
 func ensureForCLIRead(dir string) error {
 	busy, err := index.EnsureUnlessBusy(dir, os.Stderr)
 	answeredFromSnapshot.Store(busy)
+	if line := manualIndexLine(dir); err == nil && line != "" {
+		saidManualIndex.Do(func() { fmt.Fprintln(os.Stderr, line) })
+	}
 	if busy {
 		requestWarmup(dir)
 		saidReadingAsItWas.Do(func() {
-			fmt.Fprintln(os.Stderr, "deja: answering from the index as it was — refreshing in the background")
+			c := index.SnapshotCoverage(dir)
+			c.Stale = true
+			fmt.Fprintln(os.Stderr, "deja: "+coverageLine(c))
 		})
 	}
 	return err
 }
 
 var saidReadingAsItWas sync.Once
+
+// saidManualIndex keeps the index-date line to one per command.
+var saidManualIndex sync.Once
 
 // answeredFromSnapshot is whether the last ensureForCLIRead skipped the update
 // because another deja held the lock.
@@ -4041,7 +4141,7 @@ func orphanedTombstones(dir string, keys []string) map[string]bool {
 			return seen, seen != nil
 		}
 		var found map[string]bool
-		for _, h := range sources.Registry() {
+		for _, h := range sources.StoresToRead() {
 			if h.Name != harness || h.Load == nil {
 				continue
 			}
@@ -5051,6 +5151,10 @@ func dirWritable(dir string) bool {
 func ensureError(dir string, err error) error {
 	if dir == "" {
 		dir = index.DefaultDir()
+	}
+	// Worded for the reader already, command included (#5385).
+	if index.IsManualStop(err) {
+		return err
 	}
 	if errors.Is(err, fs.ErrPermission) {
 		// An ejected volume takes its mount point with it, and creating that

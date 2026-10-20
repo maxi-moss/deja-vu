@@ -62,6 +62,8 @@ Every SQLite store above is read through the local `sqlite3` command — opencod
 
 Every one of those reads carries a wall-clock budget, ten minutes by default. One sqlite3 child once ran 13m54s with 0.75s of CPU in deja itself, and nothing in the tree set a deadline, so the run looked hung rather than slow. A store that runs out is an ordinary read error: the harness reports as unreadable, `deja doctor` names it, and the rest of the index still builds. `DEJA_STORE_TIMEOUT` takes a duration, and a zero or negative one turns the cap off for someone who would rather wait than lose a store.
 
+A transcript read has the same budget, counted from the last byte read through the line and document readers rather than from the start, and so do the walk's reads of a changed transcript's head and tail. A file on a mount that stopped answering is skipped and named as unreadable once it has moved nothing for that long, and a slow read that keeps moving is left alone. A read given up marks its directory, so the rest of that directory is skipped at once for the rest of the process instead of costing the budget again. Its goroutine is not waited for; if the blocked call ever returns, what the parser reports after that is dropped. Readers that do not go through those readers (sqlite3 children, `os.ReadFile` in a few parsers) get the budget as a plain wall-clock limit.
+
 ## Index format
 
 Default path: `~/.cache/deja/index.db`.
@@ -210,7 +212,16 @@ tools and the CLI take that path — a rewrite of a gigabyte of records and
 buckets is not a cost a query can pay — while `deja index` and
 `deja search --rebuild` still do the work in front of you.
 
-Cold rebuild does all parsing first, then writes `records.bin`, buckets, and manifest from one goroutine. That keeps the on-disk index coherent and avoids concurrent writers. The five sidecars derived afterwards — the co-occurrence map, fix pairs, the recurring-command table, the failures and the session facts — each write their own file and read nothing the others write, so they run together, and fix mining and the co-occurrence map also run per session across cores. That is most of the difference between a 51s and a 30s rebuild on a real store.
+`DEJA_NO_AUTO_INDEX=1`, or `"auto_index": false` in `policy.json`, turns all
+of that off for a machine that indexes from cron. Every `Ensure*` then answers
+from the index on disk or returns an error naming `deja index`, `requestWarmup`
+spawns nothing, and the self-healing rebuild of a corrupt bucket becomes an
+error. Only commands someone runs write: `deja index`,
+`deja search --rebuild`, and the ones that change the index on purpose
+(`forget`, `sync`).
+Answers carry the index date in one line.
+
+Cold rebuild does all parsing first, then writes `records.bin`, buckets, and manifest from one goroutine. That keeps the on-disk index coherent and avoids concurrent writers. The five sidecars derived afterwards — the co-occurrence map, fix pairs, the recurring-command table, the failures and the session facts — each write their own file and read nothing the others write, so they run together, and fix mining and the co-occurrence map also run per session across cores. That is most of the difference between a 51s and a 30s rebuild on a real store. A search-only index (`DEJA_SEARCH_ONLY`, `"search_only"` in `policy.json`) skips all five on every pass and records that in the manifest, so `deja fix` can say why it has nothing. Only a first build or `deja index` run by hand applies the setting, rebuilding once when it changes; automatic passes keep the one on disk, so a hook under another environment cannot rebuild the store back and forth.
 
 ## MCP server design
 
@@ -324,7 +335,7 @@ Search intersects postings to find candidates, then scores each with BM25 over t
 
 `recall_context` and the hooks reuse the same scored order; the point-of-action decision line comes from the same conclusion extraction the digest uses.
 
-Reading one session back (`ctx`, `recall_context`, the session resource) puts the code it changed under the header, ahead of the conversation, so a digest cut to its budget loses the end of the talk rather than the fix. The edits are read from the transcript at that moment (`sources.Changes`: Claude Code edits, Codex `apply_patch` calls, and for other harnesses any edit-shaped call in a JSON transcript that holds one session): the index keeps the written side of an edit only as line hashes, and that stays so.
+Reading one session back (`ctx`, `recall_context`, the session resource) puts the code it changed under the header, ahead of the conversation, so a digest cut to its budget loses the end of the talk rather than the fix. A cut says so where it happens: a turn cut short ends with how much of it was left out, the window ends with how many turns it showed and whether the last one is among them, and both name `deja show <id>`, which prints every stored turn; changes that did not fit are counted. The edits are read from the transcript at that moment (`sources.Changes`: Claude Code edits, Codex `apply_patch` calls, and for other harnesses any edit-shaped call in a JSON transcript that holds one session): the index keeps the written side of an edit only as line hashes, and that stays so.
 
 ## Semantic sidecar
 

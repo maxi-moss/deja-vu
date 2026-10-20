@@ -116,6 +116,10 @@ func searchDetailedRead(dir string, o query.Options) (SearchResult, error) {
 	if !recordsReadable(dir, m) {
 		return SearchResult{}, fmt.Errorf("%w: records.bin size does not match the manifest (crash-truncated or uncommitted tail)", errCorruptIndex)
 	}
+	// One ranking per pass: the part-of-word step and the tail under a thin
+	// answer both ask for it with the same query, and each read and scored
+	// fifty sessions (#5378).
+	ranking := &relevanceOnce{}
 	var posts []posting
 	var fallbackVariants map[string][]string
 	fallbackTier := query.TierExact
@@ -158,7 +162,7 @@ func searchDetailedRead(dir string, o query.Options) (SearchResult, error) {
 					// the ladder used to stop there. When the query carries
 					// enough informative words to rank by relevance, prefer
 					// that ranking and keep the substring hits as the tail.
-					if rel, rerr := relevanceSearch(dir, m, o); rerr == nil && len(rel.Sessions) > 0 {
+					if rel, rerr := ranking.get(dir, m, o); rerr == nil && len(rel.Sessions) > 0 {
 						// With the variants too, for the reason the scan below
 						// takes them: a compound spelled apart is not a
 						// substring of what the store wrote, so this
@@ -219,12 +223,12 @@ func searchDetailedRead(dir string, o query.Options) (SearchResult, error) {
 			if result, ferr := stemSearch(dir, m, o); ferr != nil {
 				return SearchResult{}, fmt.Errorf("stem postings: %w", ferr)
 			} else if result.Stemmed {
-				return withRelevanceTail(dir, m, o, result)
+				return withRelevanceTail(ranking, dir, m, o, result)
 			}
 			if result, ferr := fuzzySearch(dir, m, o); ferr != nil {
 				return SearchResult{}, fmt.Errorf("fuzzy postings: %w", ferr)
 			} else if result.Fuzzy {
-				return withRelevanceTail(dir, m, o, result)
+				return withRelevanceTail(ranking, dir, m, o, result)
 			}
 			// Two words that never appear together is the state the
 			// co-occurrence rescue was written for — "login" next to "jwks"
@@ -233,7 +237,7 @@ func searchDetailedRead(dir string, o query.Options) (SearchResult, error) {
 			if result, ferr := cooccurSearch(dir, m, o); ferr != nil {
 				return SearchResult{}, fmt.Errorf("cooccur postings: %w", ferr)
 			} else if len(result.Sessions) > 0 {
-				return withRelevanceTail(dir, m, o, result)
+				return withRelevanceTail(ranking, dir, m, o, result)
 			}
 			// A pasted error that matched no postings is the case the word
 			// ladder cannot win: its identifiers are line numbers and hashes.
@@ -243,7 +247,7 @@ func searchDetailedRead(dir string, o query.Options) (SearchResult, error) {
 			} else if len(result.Sessions) > 0 {
 				return result, nil
 			}
-			ranked, rerr := relevanceSearch(dir, m, o)
+			ranked, rerr := ranking.get(dir, m, o)
 			if rerr != nil || len(ranked.Sessions) > 0 {
 				return ranked, rerr
 			}
@@ -274,17 +278,17 @@ func searchDetailedRead(dir string, o query.Options) (SearchResult, error) {
 		if result, ferr := stemSearch(dir, m, o); ferr != nil {
 			return SearchResult{}, fmt.Errorf("stem postings: %w", ferr)
 		} else if result.Stemmed {
-			return withRelevanceTail(dir, m, o, result)
+			return withRelevanceTail(ranking, dir, m, o, result)
 		}
 		if result, ferr := fuzzySearch(dir, m, o); ferr != nil {
 			return SearchResult{}, fmt.Errorf("fuzzy postings: %w", ferr)
 		} else if result.Fuzzy {
-			return withRelevanceTail(dir, m, o, result)
+			return withRelevanceTail(ranking, dir, m, o, result)
 		}
 		if result, ferr := cooccurSearch(dir, m, o); ferr != nil {
 			return SearchResult{}, fmt.Errorf("cooccur postings: %w", ferr)
 		} else if len(result.Sessions) > 0 {
-			return withRelevanceTail(dir, m, o, result)
+			return withRelevanceTail(ranking, dir, m, o, result)
 		}
 		// A pasted error that matched no postings is the case the word
 		// ladder cannot win: its identifiers are line numbers and hashes.
@@ -294,12 +298,12 @@ func searchDetailedRead(dir string, o query.Options) (SearchResult, error) {
 		} else if len(result.Sessions) > 0 {
 			return result, nil
 		}
-		return relevanceSearch(dir, m, o)
+		return ranking.get(dir, m, o)
 	}
 	if err != nil {
 		return SearchResult{}, err
 	}
-	return withRelevanceTail(dir, m, o, SearchResult{Sessions: ss, Tier: fallbackTier, Variants: fallbackVariants})
+	return withRelevanceTail(ranking, dir, m, o, SearchResult{Sessions: ss, Tier: fallbackTier, Variants: fallbackVariants})
 }
 
 // sessionKeySet keys sessions the way StrictIDs is keyed, for the paths that
@@ -369,8 +373,9 @@ func fusedPlace(relevanceRank int, strict bool) int {
 //
 // Order is the contract here. RelevanceHits scores by arrival (len-rank), so
 // the merged order survives to the caller untouched; anything that re-sorts
-// this by exact-match scoring would undo the point.
-func withRelevanceTail(dir string, m Manifest, o query.Options, res SearchResult) (SearchResult, error) {
+// this by exact-match scoring would undo the point. once is the pass's ranking,
+// shared with the part-of-word step that may already have run it.
+func withRelevanceTail(once *relevanceOnce, dir string, m Manifest, o query.Options, res SearchResult) (SearchResult, error) {
 	ss := res.Sessions
 	if len(ss) == 0 || len(ss) >= thinAND {
 		return res, nil
@@ -383,7 +388,7 @@ func withRelevanceTail(dir string, m Manifest, o query.Options, res SearchResult
 	// relevanceSearch declines quoted phrases, regex, and queries with fewer
 	// than two informative words, which is exactly the set that wants its
 	// strict answer left alone.
-	rel, err := relevanceSearch(dir, m, o)
+	rel, err := once.get(dir, m, o)
 	if err != nil || len(rel.Sessions) == 0 {
 		// A tail is an improvement, not a requirement: if ranking the whole
 		// store fails, the strict answer is still a correct answer.
@@ -484,6 +489,22 @@ func withRelevanceTail(dir string, m Manifest, o query.Options, res SearchResult
 	return out, nil
 }
 
+// relevanceOnce is relevanceSearch for one pass of the ladder, run the first
+// time it is asked for and handed back after that.
+type relevanceOnce struct {
+	done bool
+	res  SearchResult
+	err  error
+}
+
+func (r *relevanceOnce) get(dir string, m Manifest, o query.Options) (SearchResult, error) {
+	if !r.done {
+		r.res, r.err = relevanceSearch(dir, m, o)
+		r.done = true
+	}
+	return r.res, r.err
+}
+
 // droppedAWord reports that the word-form ladder gave up on one of the query's
 // words: an empty variant is how it records "no session matches it with the
 // rest of the query".
@@ -538,6 +559,10 @@ func RelevanceMatchTerms(q string) []string {
 // the return, so a caller counting sessions is counting the window.
 const relevanceWindow = 50
 
+// relevanceRuns counts relevance rankings, for the test that pins one to a
+// pass of the ladder.
+var relevanceRuns atomic.Int64
+
 // relevanceSearch is the ladder's last resort: no AND survived, so rank every
 // session by IDF-weighted overlap with the query's informative words. Order
 // carries the ranking; callers must not re-sort by exact-match BM25 (the whole
@@ -545,6 +570,7 @@ const relevanceWindow = 50
 // two informative terms — one lucky word is noise, the same bar the déjà vu
 // hook applies.
 func relevanceSearch(dir string, m Manifest, o query.Options) (SearchResult, error) {
+	relevanceRuns.Add(1)
 	// A quoted phrase is an explicit exactness request; loosening it into
 	// bag-of-words relevance would betray what the user asked for.
 	if strings.Contains(o.Query, "\"") || o.Regex {
@@ -1904,6 +1930,9 @@ func SearchWithRecoveryDetailed(dir string, o query.Options, progress io.Writer)
 	r, err := SearchDetailed(dir, o)
 	if err == nil || !IsCorrupt(err) {
 		return r, err
+	}
+	if autoUpdatesOff() {
+		return SearchResult{}, &ManualStop{damagedOrOutdated(err) + ", and automatic indexing is off — rebuild it with: deja index --rebuild"}
 	}
 	if progress != nil {
 		fmt.Fprintf(progress, "deja: %s (%v), rebuilding ...\n", damagedOrOutdated(err), err)
@@ -3653,7 +3682,16 @@ func intersectSubstringPostingsDetailed(dir string, bare []string) ([]posting, m
 		return nil, nil, nil
 	}
 	if len(bare) > 3 {
-		bare = bare[:3] // longest-first; keep the expansion bounded
+		bare = bare[:3] // the first three as typed; keep the expansion bounded
+	}
+	// From the directories the catalog already holds. Reading all of them off
+	// disk again, every bucket of the store, was most of what this step cost,
+	// and it runs whenever the words never meet as typed, which is most
+	// Russian questions (#5378).
+	if idx, err := tokenIndexCached(dir); err == nil && idx.dirs != nil {
+		if posts, variants, ok, err := substringPostingsFrom(idx.dirs, bare); ok || err != nil {
+			return posts, variants, err
+		}
 	}
 	buckets, err := os.ReadDir(filepath.Join(dir, "buckets"))
 	if err != nil {
@@ -3662,26 +3700,44 @@ func intersectSubstringPostingsDetailed(dir string, bare []string) ([]posting, m
 		}
 		return nil, nil, err
 	}
+	var dirs []bucketDir
+	for _, de := range buckets {
+		if de.IsDir() || !strings.HasSuffix(de.Name(), ".bin") {
+			continue
+		}
+		dirs = append(dirs, bucketDir{path: filepath.Join(dir, "buckets", de.Name())})
+	}
+	posts, variants, _, err := substringPostingsFrom(dirs, bare)
+	return posts, variants, err
+}
+
+// substringPostingsFrom intersects, word by word, the postings of every token
+// that contains the word. A bucket with entries is read through them, and ok
+// is false when its file is no longer the one they were read from, so the
+// caller reads the store as it is now; one without is read off disk.
+func substringPostingsFrom(dirs []bucketDir, bare []string) (_ []posting, _ map[string][]string, ok bool, _ error) {
 	perTok := make([]map[int64]posting, len(bare))
 	variants := make(map[string][]string, len(bare))
 	for i := range perTok {
 		perTok[i] = map[int64]posting{}
 	}
-	for _, de := range buckets {
-		if de.IsDir() || !strings.HasSuffix(de.Name(), ".bin") {
-			continue
-		}
-		path := filepath.Join(dir, "buckets", de.Name())
-		entries, f, err := openBucketDir(path)
-		if err != nil {
-			// The directory listing named this bucket, so a miss now means a
-			// concurrent rebuild swapped it out — tolerate that. Anything else
-			// (a corrupt header, a denied read) is real and is surfaced so the
-			// fuzzy tier does not silently under-match a damaged store.
-			if os.IsNotExist(err) {
-				continue
+	for _, bd := range dirs {
+		entries := bd.entries
+		var f *os.File
+		if entries == nil {
+			var err error
+			entries, f, err = openBucketDir(bd.path)
+			if err != nil {
+				// The directory listing named this bucket, so a miss now means
+				// a concurrent rebuild swapped it out — tolerate that. Anything
+				// else (a corrupt header, a denied read) is real and is
+				// surfaced so the fuzzy tier does not silently under-match a
+				// damaged store.
+				if os.IsNotExist(err) {
+					continue
+				}
+				return nil, nil, false, err
 			}
-			return nil, nil, err
 		}
 		for _, e := range entries {
 			tok := strings.TrimPrefix(e.tok, "t")
@@ -3689,25 +3745,39 @@ func intersectSubstringPostingsDetailed(dir string, bare []string) ([]posting, m
 				if !strings.Contains(tok, b) {
 					continue
 				}
+				if f == nil {
+					var err error
+					if f, err = openIndexFile(bd.path); err != nil {
+						return nil, nil, false, nil
+					}
+					// The same file, not one of the same size: a rebuild renames a
+					// new bucket in, and a coarse clock can give it the old time.
+					if fi, err := f.Stat(); err != nil || !os.SameFile(fi, bd.stat) || fi.Size() != bd.stat.Size() || !fi.ModTime().Equal(bd.stat.ModTime()) {
+						f.Close()
+						return nil, nil, false, nil
+					}
+				}
 				variants[b] = append(variants[b], tok)
 				buf := make([]byte, e.n)
 				if _, err := f.ReadAt(buf, int64(e.off)); err != nil {
 					// The bucket directory validated but the block it points to
 					// will not read: corruption, not a missing token. Surface it.
 					f.Close()
-					return nil, nil, fmt.Errorf("%w: %v", errCorruptIndex, err)
+					return nil, nil, false, fmt.Errorf("%w: %v", errCorruptIndex, err)
 				}
 				posts, err := decodePostingBlock(buf)
 				if err != nil {
 					f.Close()
-					return nil, nil, err
+					return nil, nil, false, err
 				}
 				for _, p := range posts {
 					perTok[i][p.Off] = p
 				}
 			}
 		}
-		f.Close()
+		if f != nil {
+			f.Close()
+		}
 	}
 	set := perTok[0]
 	for _, m := range perTok[1:] {
@@ -3719,7 +3789,7 @@ func intersectSubstringPostingsDetailed(dir string, bare []string) ([]posting, m
 		}
 		set = next
 		if len(set) == 0 {
-			return nil, nil, nil
+			return nil, nil, true, nil
 		}
 	}
 	out := make([]posting, 0, len(set))
@@ -3730,7 +3800,7 @@ func intersectSubstringPostingsDetailed(dir string, bare []string) ([]posting, m
 	for token := range variants {
 		sort.Strings(variants[token])
 	}
-	return out, variants, nil
+	return out, variants, true, nil
 }
 
 // commonTokenPostings is where a word stops being worth widening. Below it a
@@ -3842,13 +3912,13 @@ func stemPostings(dir string, terms, phrases []string) ([]posting, map[string][]
 	if !hasStemToken(terms) {
 		return nil, nil, nil
 	}
-	catalog, err := tokenCatalogCached(dir)
+	catalog, err := tokenIndexCached(dir)
 	if err != nil {
 		return nil, nil, err
 	}
 	matchesPer := make([][]string, len(terms))
 	for i, term := range terms {
-		matchesPer[i] = stemMatches(term, catalog)
+		matchesPer[i] = stemMatches(term, catalog.set)
 	}
 	// Whatever the catalog has no whole word for gets one pass looking for the
 	// word inside a token that glued it to something else. One pass for all of
@@ -3951,6 +4021,10 @@ func hasStemToken(terms []string) bool {
 	return false
 }
 
+// gluedCompared counts the tokens the glued step held up against a form, for
+// the test that pins it to the question rather than the catalog (#5386).
+var gluedCompared atomic.Int64
+
 // fillGluedMatches finds a term's other forms inside tokens that glued the
 // word to something else: "k8sнастройки" holds "настройки" and is one token,
 // so nothing splits it and stemMatches, which asks the catalog for whole
@@ -3964,7 +4038,7 @@ func hasStemToken(terms []string) bool {
 // transcript used, while in Latin the same rule reaches "latest" from "tests"
 // and "preserve" from "press". English compounds have their own road — the
 // indexer splits them into parts — and this one would only add coincidences.
-func fillGluedMatches(terms []string, matchesPer [][]string, catalog map[string]bool) {
+func fillGluedMatches(terms []string, matchesPer [][]string, catalog *tokenIndex) {
 	formsPer := make([][]string, len(terms))
 	want := false
 	for i, term := range terms {
@@ -3983,26 +4057,53 @@ func fillGluedMatches(terms []string, matchesPer [][]string, catalog map[string]
 	if !want {
 		return
 	}
+	// The token has to be the word plus something, and the something is what
+	// makes this rung necessary — so the length is measured against the form,
+	// not against the term, which is the longer of the two when the query is
+	// in a case with a long ending. A token that starts or ends with the form
+	// and is longer in bytes is longer in runes too, since the form ends on a
+	// whole rune.
+	//
+	// Looked up by the form's first and last four runes rather than by walking
+	// the catalog once per form: the walk counted the runes of every token in
+	// the store for each of a Cyrillic term's hundred-odd forms, which was most
+	// of a recall's time on a 12k-session store and grew with it (#5386).
+	glued := catalog.gluedKeys()
 	found := make([]map[string]bool, len(terms))
-	for tok := range catalog {
-		for i, forms := range formsPer {
-			for _, f := range forms {
-				// The token has to be the word plus something, and the
-				// something is what makes this rung necessary — so the length
-				// is measured against the form, not against the term, which is
-				// the longer of the two when the query is in a case with a long
-				// ending. Runes on both sides: a byte comparison would admit a
-				// token one byte longer, which in Cyrillic is no character at
-				// all.
-				if len([]rune(tok)) <= len([]rune(f)) ||
-					(!strings.HasPrefix(tok, f) && !strings.HasSuffix(tok, f)) {
-					continue
+	for i, forms := range formsPer {
+		for _, f := range forms {
+			if isASCIIString(f) || !utf8.ValidString(f) {
+				// The keys are taken over non-ASCII tokens by whole runes,
+				// which is no way to find an ASCII form or a broken one;
+				// those are walked for under the old rule.
+				for tok := range catalog.set {
+					gluedCompared.Add(1)
+					if len([]rune(tok)) > len([]rune(f)) && (strings.HasPrefix(tok, f) || strings.HasSuffix(tok, f)) {
+						if found[i] == nil {
+							found[i] = map[string]bool{}
+						}
+						found[i][tok] = true
+					}
 				}
-				if found[i] == nil {
-					found[i] = map[string]bool{}
+				continue
+			}
+			heads, tails := glued.head[runeHead(f, gluedKeyRunes)], glued.tail[runeTail(f, gluedKeyRunes)]
+			gluedCompared.Add(int64(len(heads) + len(tails)))
+			for _, tok := range heads {
+				if len(tok) > len(f) && strings.HasPrefix(tok, f) {
+					if found[i] == nil {
+						found[i] = map[string]bool{}
+					}
+					found[i][tok] = true
 				}
-				found[i][tok] = true
-				break
+			}
+			for _, tok := range tails {
+				if len(tok) > len(f) && strings.HasSuffix(tok, f) {
+					if found[i] == nil {
+						found[i] = map[string]bool{}
+					}
+					found[i][tok] = true
+				}
 			}
 		}
 	}
@@ -4378,28 +4479,57 @@ func hasFuzzyToken(terms []string, idx *tokenIndex) bool {
 }
 
 func tokenCatalog(dir string) (map[string]bool, error) {
+	catalog, _, err := tokenCatalogDirs(dir)
+	return catalog, err
+}
+
+// bucketDir is one bucket file's directory as the catalog read it, with the
+// file as stat saw it then, so a reader can tell the file it opens later is
+// still that one.
+type bucketDir struct {
+	path    string
+	stat    os.FileInfo
+	entries []bucketEntry
+}
+
+// tokenCatalogDirs is tokenCatalog that also keeps each bucket's directory.
+func tokenCatalogDirs(dir string) (map[string]bool, []bucketDir, error) {
 	entries, err := os.ReadDir(filepath.Join(dir, "buckets"))
 	if err != nil {
 		if os.IsNotExist(err) {
-			return map[string]bool{}, nil
+			return map[string]bool{}, nil, nil
 		}
-		return nil, err
+		return nil, nil, err
 	}
-	catalog := map[string]bool{}
+	var dirs []bucketDir
+	tokens := 0
 	for _, de := range entries {
 		if de.IsDir() || !strings.HasSuffix(de.Name(), ".bin") {
 			continue
 		}
-		header, f, err := openBucketDir(filepath.Join(dir, "buckets", de.Name()))
+		path := filepath.Join(dir, "buckets", de.Name())
+		header, f, err := openBucketDir(path)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		for _, entry := range header {
+		fi, serr := f.Stat()
+		_ = f.Close()
+		if serr != nil {
+			return nil, nil, serr
+		}
+		tokens += len(header)
+		dirs = append(dirs, bucketDir{path: path, stat: fi, entries: header})
+	}
+	// Sized before it is filled: grown one token at a time, the map was
+	// rehashed its way up to every token in the store, a third of what a
+	// command-line search that reaches the catalog spent on it (#5386).
+	catalog := make(map[string]bool, tokens)
+	for _, d := range dirs {
+		for _, entry := range d.entries {
 			catalog[strings.TrimPrefix(entry.tok, "t")] = true
 		}
-		_ = f.Close()
 	}
-	return catalog, nil
+	return catalog, dirs, nil
 }
 
 func closeTokens(query string, idx *tokenIndex) []string {
@@ -4513,15 +4643,27 @@ func damerauDistanceRunes(a, b string, max int) int {
 	if abs(utf8.RuneCountInString(a)-utf8.RuneCountInString(b)) > max {
 		return max + 1
 	}
-	ar, br := []rune(a), []rune(b)
-	prev := make([]int, len(br)+1)
+	// On the stack for a word of ordinary length. The close tier runs this
+	// against every catalog token within two runes of the query's length, and
+	// for a Cyrillic word that is tens of thousands of them: a slice per row
+	// was most of what a Russian close-spelling step cost (#5378).
+	var abuf, bbuf [maxIndexedTokenLen + 1]rune
+	var rows [3][maxIndexedTokenLen + 2]int
+	ar, br := runesInto(abuf[:0], a), runesInto(bbuf[:0], b)
+	var prev, prevPrev, cur []int
+	if len(br)+1 <= len(rows[0]) {
+		prev, prevPrev, cur = rows[0][:len(br)+1], rows[1][:len(br)+1], rows[2][:len(br)+1]
+	} else {
+		prev, prevPrev, cur = make([]int, len(br)+1), make([]int, len(br)+1), make([]int, len(br)+1)
+	}
 	for j := range prev {
 		prev[j] = j
 	}
-	prevPrev := append([]int(nil), prev...)
+	copy(prevPrev, prev)
+	prevMin := 0
 	for i := 1; i <= len(ar); i++ {
-		cur := make([]int, len(br)+1)
 		cur[0] = i
+		rowMin := i
 		for j := 1; j <= len(br); j++ {
 			cost := 0
 			if ar[i-1] != br[j-1] {
@@ -4531,10 +4673,28 @@ func damerauDistanceRunes(a, b string, max int) int {
 			if i > 1 && j > 1 && ar[i-1] == br[j-2] && ar[i-2] == br[j-1] {
 				cur[j] = min(cur[j], prevPrev[j-2]+1)
 			}
+			rowMin = min(rowMin, cur[j])
 		}
-		prevPrev, prev = prev, cur
+		// Every cell is built from the two rows above it, each step adding
+		// nothing or one, so once two rows in a row are past max no later
+		// row comes back under it. The callers only ask whether a token is
+		// within max, and past it any number above max answers that.
+		if rowMin > max && prevMin > max {
+			return max + 1
+		}
+		prevMin = rowMin
+		prevPrev, prev, cur = prev, cur, prevPrev
 	}
 	return prev[len(br)]
+}
+
+// runesInto appends s's runes to buf, which is how a short word is decoded
+// without allocating.
+func runesInto(buf []rune, s string) []rune {
+	for _, r := range s {
+		buf = append(buf, r)
+	}
+	return buf
 }
 
 // isMark reports whether r is a combining mark: Mn covers Arabic harakat,

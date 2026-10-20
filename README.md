@@ -554,6 +554,28 @@ store, and 0.59 s for the per-prompt hook on an index of 19k sessions.
 </details>
 
 <details>
+<summary><b>Can I stop it reindexing on its own?</b></summary>
+
+Yes. On a busy server, `DEJA_NO_AUTO_INDEX=1` or `"auto_index": false` in
+`~/.config/deja/policy.json` stops every automatic update. Search, MCP recall and hooks
+answer from the last finished index and say when it was updated, and nothing deja starts
+on its own writes it. Run `deja index` from cron or a systemd timer.
+
+</details>
+
+<details>
+<summary><b>Can I index for search only?</b></summary>
+
+Yes. `DEJA_SEARCH_ONLY=1` or `"search_only": true` in `~/.config/deja/policy.json` skips
+mining fixes, commands and co-occurrence, about a fifth of a build's CPU; it takes effect
+on the next `deja index`. Search, recall and blame work as before; `deja fix` says the
+index is search-only. The `DEJA_INDEX_*` switches
+that keep commands, tool output, paths and edits out of the index, and what each one
+turns off, are in the [commands guide](https://vshulcz.github.io/deja-vu/guide/commands.html#what-the-index-keeps).
+
+</details>
+
+<details>
 <summary><b>Do I have to change how I work?</b></summary>
 
 No. The agent calls recall itself, and with

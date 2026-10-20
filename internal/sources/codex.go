@@ -356,8 +356,12 @@ func parseCodexRolloutPath(path string, offset int64, id, project, harness strin
 	head := ""
 	headID := ""
 	if offset > 0 {
-		if id, cwd, payload := codexRolloutHead(path); id != "" {
+		if id, cwd, payload, at := codexRolloutHead(path); id != "" {
 			s.ID, headID = id, id
+			// The read from the start touches the meta line's time too. A
+			// rollout first read with nothing but its meta held no session,
+			// so its start would come from the tail alone.
+			s.Touch(at)
 			s.Kind, s.Parent = codexLineage(payload)
 			if cwd != "" {
 				s.Project = projectName(cwd)
@@ -769,25 +773,37 @@ func codexRoledBefore(path string, offset int64) bool {
 }
 
 // codexRolloutHead reads the identity a rollout declares in its first record.
-func codexRolloutHead(path string) (id, cwd string, payload map[string]any) {
+func codexRolloutHead(path string) (id, cwd string, payload map[string]any, at time.Time) {
 	f, err := os.Open(path)
 	if err != nil {
-		return "", "", nil
+		return "", "", nil, time.Time{}
 	}
 	defer func() { _ = f.Close() }()
 	// Read by line with no cap, as the parse itself reads: a session_meta
 	// carrying long instructions runs past a megabyte, and a capped scanner
-	// lost the id, so a resumed tail was filed as a session of its own.
-	r := bufio.NewReaderSize(f, 64*1024)
+	// lost the id, so a resumed tail was filed as a session of its own. A line
+	// past the buffer is streamed, as the parse streams it, so a command's
+	// output of a hundred megabytes near the top is not held whole (#5391).
+	r := bufio.NewReaderSize(f, jsonlBuffer)
 	// The meta record is the first line in every rollout Codex writes; a few
 	// lines of slack costs nothing and covers a format that adds a preamble.
 	for i := 0; i < 8; i++ {
-		line, err := r.ReadBytes('\n')
+		l, err := readJSONLine(r)
 		var rec struct {
-			Type    string         `json:"type"`
-			Payload map[string]any `json:"payload"`
+			Timestamp any            `json:"timestamp"`
+			Type      string         `json:"type"`
+			Payload   map[string]any `json:"payload"`
 		}
-		if json.Unmarshal(trimJSONSpace(line), &rec) != nil || rec.Type != "session_meta" {
+		ok := false
+		if l.long {
+			rec.Type, _ = l.m["type"].(string)
+			rec.Payload, _ = l.m["payload"].(map[string]any)
+			rec.Timestamp = l.m["timestamp"]
+			ok = l.ok
+		} else {
+			ok = json.Unmarshal(trimJSONSpace(l.raw), &rec) == nil
+		}
+		if !ok || rec.Type != "session_meta" {
 			if err != nil {
 				break
 			}
@@ -797,9 +813,9 @@ func codexRolloutHead(path string) (id, cwd string, payload map[string]any) {
 		if id, _ = rec.Payload["id"].(string); id == "" {
 			id, _ = rec.Payload["session_id"].(string)
 		}
-		return id, cwd, rec.Payload
+		return id, cwd, rec.Payload, parseTimeAny(rec.Timestamp)
 	}
-	return "", "", nil
+	return "", "", nil, time.Time{}
 }
 
 // codexLineage is what a rollout's own session_meta says about where the thread

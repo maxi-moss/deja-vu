@@ -1157,6 +1157,17 @@ type Manifest struct {
 	// search rewrote the manifest for 1500 rollouts it still could not read
 	// (#5105). Additive: an older store decodes with it empty.
 	Deferred map[string]FileState `json:"deferred,omitempty"`
+	// PartialOf is set on the early index a big first build publishes before
+	// it finishes: how many sessions that build found, of which this index
+	// holds only the newest. An answer from it has to say the older ones are
+	// missing, not the newest (#5390). Zero on every complete index.
+	PartialOf int `json:"partial_of,omitempty"`
+	// SearchOnly says the build skipped the derived tables — fixes,
+	// co-occurrence, commands, command failures, session facts — because
+	// DEJA_SEARCH_ONLY or "search_only" asked it to (#5395). A reader of one
+	// of those tables says so rather than answering empty, and a pass whose
+	// setting differs rebuilds once.
+	SearchOnly bool `json:"search_only,omitempty"`
 }
 
 // HarnessIngest is one harness's ingestion health from its last indexing pass.
@@ -1192,6 +1203,11 @@ type FileIngest struct {
 	// back only what changed, so a pass carries the rows it did not re-read
 	// instead of reporting them gone. Out of the JSON: the count is the contract.
 	Unusable map[string]string `json:"-"`
+	// Walk marks an Error the store walk found rather than a parser: a
+	// directory it could not list or a transcript it may not read. Only those
+	// are cleared by a later walk that reads the path, because a parse error
+	// on a file that has not changed is still the file's (#5393).
+	Walk bool `json:"-"`
 }
 
 type manifestCore struct {
@@ -1221,6 +1237,8 @@ type manifestCore struct {
 	KeptDated          bool
 	ReadZone           string
 	Deferred           map[string]FileState
+	PartialOf          int
+	SearchOnly         bool
 }
 
 type RedactionStats struct {
@@ -1329,6 +1347,8 @@ type importedState struct {
 	boundary    map[string][]uint64
 	dedupe      map[string]bool
 	compactions map[string]CompactionState
+	// partialOf: see Manifest.PartialOf.
+	partialOf int
 }
 
 type tokenJob struct {

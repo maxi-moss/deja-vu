@@ -101,6 +101,30 @@ file that can't be appended no longer sends the rest of the pass through a full
 re-parse: a 400 MB transcript that grew 281 KB next to a touched 100 MB one
 took 25 s to index, now about 2 s.
 
+A pass that rewrites the index no longer re-encodes and re-tokenizes every
+session it keeps: they are copied as stored and keep their postings. On a
+12,000-session store a pass over 9 changed transcripts took 45 s, now 7 s
+(#5383).
+
+A pass that reads Codex's, TRAE's or Claude Code's history.jsonl beside other
+changes replaces only the sessions with a new prompt in it, not every session
+known from the log alone (#5403).
+A search no longer pays for the size of the store before it has found
+anything. On a 12,000-session store a Russian recall that looks for a word
+glued to another took 1.8-3.3 s, now 0.15-0.3 s, and checking what changed
+since the last pass takes 30 ms instead of 190 ms (#5386).
+A Codex line of a hundred megabytes, a command's whole output, no longer
+holds several copies of itself in memory: a JSONL line past 1 MB is decoded as
+it streams, each string kept to the 1 MB a message is cut to anyway. An
+incremental pass over one went from 628 MB to 42 MB peak. Every line that is
+not one JSON object now counts as skipped; a `null` line or one with more after
+the object went uncounted (#5391).
+
+After a pass rewrites the index, the friction texts, the command-failure table
+and the record offset table are brought up to date from the sessions the pass
+changed instead of each reading the whole record log again: 2.0 s to 1.75 s
+per pass on a 12,000-session store (#5402).
+
 When two transcripts hold the same session id, a pass that rewrites one reads
 the other again too, so a turn both hold is no longer indexed twice and a copy's
 turns are no longer dropped until `deja index --rebuild`.
@@ -124,6 +148,42 @@ put in front of queries and indexed texts. Vectors made with another model or
 passage prefix are no longer compared with the query: search says so once and
 goes on lexically. A long-running `deja mcp` keeps the parsed vector sidecar
 between semantic searches and lets it go two minutes after the last one.
+
+`DEJA_NO_AUTO_INDEX=1`, or `"auto_index": false` in policy.json, stops every
+automatic index update, for a busy machine that runs `deja index` from cron.
+Search, show, MCP tools and hooks answer from the last finished index and say
+when it was updated; with no index they print `deja index` instead of building
+one, and neither the agent nor a hook can start a refresh (#5385).
+`deja index` without `--rebuild` now notices a transcript it may not read and
+a store directory it may not list, and says so on every run while they stay
+locked instead of "index is up to date". Sessions already indexed from them stay
+searchable, a locked directory no longer reads as deleted, and `deja doctor`
+names a locked transcript even when it is not the newest one (#5393).
+
+`deja index` exits 3 when it wrote the index but left part of the input
+unread (a path it could not read, a line it skipped), so a cron job or a timer
+can tell that from a clean run; 1 still means the index was not written. Piped
+or under cron it prints one line per phase. A transcript read that moves no
+bytes for `DEJA_STORE_TIMEOUT` (ten minutes by default) is skipped and named,
+and the rest of the run goes on; a slow read that keeps moving is not cut.
+`--rebuild` reads every line again, so a store with an old line deja cannot
+use exits 3 on every rebuild (#5396).
+While a refresh runs, search and recall say which index they answer from and
+how much of the history it holds: "answering from the index of 2026-10-19
+14:02 (3 minutes ago), 7000 sessions — refreshing in the background, 3000 of
+10000 transcripts are new or changed since". After a first build cut off past its early slice they say it
+covers only the 200 most recent of the sessions found and that the older ones
+are missing, where recall used to say the newest might be (#5390).
+`DEJA_SEARCH_ONLY=1`, or `"search_only": true` in policy.json, builds the index
+for search alone and skips mining fixes, co-occurrence, commands, command
+failures and session facts: a rebuild of a 3,000-session tool-heavy store
+takes 2.7 s of CPU instead of 3.3 s. It is applied by the first build and by
+`deja index`, so a hook running under another environment does not rebuild
+the store back.
+`deja fix` then says the index is search-only instead of that nothing ever
+followed the error, and `deja how` and `deja restore` name `DEJA_INDEX_COMMANDS=0`
+or `DEJA_INDEX_EDITS=0` when those kept their data out. The commands guide lists
+what each `DEJA_INDEX_*` switch leaves out and what stops working (#5395).
 
 ## [0.22.2] - 2026-10-17
 
